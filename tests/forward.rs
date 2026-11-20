@@ -214,13 +214,15 @@ async fn tcp_connect_timeout_resets_client() {
     let blackhole = socket.local_addr().unwrap().as_socket().unwrap();
     let mut fillers = Vec::new();
     for _ in 0..4 {
-        fillers.push(std::net::TcpStream::connect_timeout(
-            &blackhole,
-            Duration::from_millis(200),
-        ));
+        let filler =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let _ = filler.connect(&blackhole.into());
+        fillers.push(filler);
     }
+    tokio::time::sleep(Duration::from_millis(10)).await;
     let config = ForwardConfig {
-        tcp_connect_timeout: Duration::from_millis(300),
+        tcp_connect_timeout: Duration::from_millis(100),
         ..ForwardConfig::default()
     };
     let bindings = start(
@@ -230,12 +232,15 @@ async fn tcp_connect_timeout_resets_client() {
         ))],
         config,
     );
+    let started = std::time::Instant::now();
     let mut client = TcpStream::connect(first(&bindings, Protocol::Tcp))
         .await
         .unwrap();
     let mut buf = [0u8; 16];
     let result = timeout(WAIT, client.read(&mut buf)).await.unwrap();
     assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+    // Reset only after the connect timeout, not by an immediate refusal.
+    assert!(started.elapsed() >= Duration::from_millis(100));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -253,7 +258,7 @@ async fn idle_tcp_connection_is_never_timed_out() {
     let mut client = TcpStream::connect(first(&bindings, Protocol::Tcp))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     client.write_all(b"still here").await.unwrap();
     let mut buf = [0u8; 10];
     timeout(WAIT, client.read_exact(&mut buf))
@@ -352,7 +357,7 @@ async fn udp_clients_get_separate_sessions() {
 async fn udp_sessions_expire_when_idle() {
     let echo = udp_echo("127.0.0.1:0".parse().unwrap()).await;
     let config = ForwardConfig {
-        udp_idle_timeout: Duration::from_millis(300),
+        udp_idle_timeout: Duration::from_millis(150),
         ..ForwardConfig::default()
     };
     let bindings = start(
@@ -366,12 +371,13 @@ async fn udp_sessions_expire_when_idle() {
         .unwrap();
     let (first_upstream, _) = udp_roundtrip(&client, b"1").await;
     // Activity within the timeout keeps the session alive.
+    // 4 x 60ms spans well past the 150ms timeout.
     for _ in 0..4 {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let (upstream, _) = udp_roundtrip(&client, b"keep").await;
         assert_eq!(upstream, first_upstream);
     }
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let (new_upstream, _) = udp_roundtrip(&client, b"2").await;
     assert_ne!(new_upstream, first_upstream);
 }
@@ -415,7 +421,7 @@ fn ip_pktinfo_send_supported() -> bool {
     let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     client.connect((Ipv4Addr::new(127, 0, 0, 2), port)).unwrap();
     client
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
     client.send(b"probe").unwrap();
     let mut buf = [0u8; 16];
@@ -490,7 +496,7 @@ async fn udp_unreachable_target_keeps_session() {
         .await
         .unwrap();
     client.send(b"lost").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
     // The target comes up on the same port; the existing session works.
     let echo = udp_echo(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
     assert_eq!(echo.port(), port);
