@@ -88,13 +88,16 @@ fn forwarder(rt: &Runtime, target: SocketAddr, size: usize) -> (SocketAddr, Join
     let spec = format!("tcp:127.0.0.1:0:127.0.0.1:{}", target.port())
         .parse()
         .unwrap();
-    let listeners = forward::bind_all(&[spec]).unwrap();
-    let addr = listeners[0].local_addr();
     let config = ForwardConfig {
         tcp_buffer_size: size,
         ..ForwardConfig::default()
     };
-    (addr, rt.spawn(forward::serve(listeners, config)))
+    let bound = forward::bind_all(&[spec], &config).unwrap();
+    let addr = bound.listeners[0].local_addr();
+    (
+        addr,
+        rt.spawn(async move { forward::serve(bound, config).await.unwrap() }),
+    )
 }
 
 async fn throughput_gbit(addr: SocketAddr, bytes: usize) -> f64 {

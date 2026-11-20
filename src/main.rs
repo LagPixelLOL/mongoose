@@ -50,11 +50,20 @@ async fn start(specs: &[ForwardSpec]) -> Result<()> {
         Ok(limit) => debug!("open file limit: {limit}"),
         Err(err) => warn!("could not raise open file limit: {err}"),
     }
-    let listeners = forward::bind_all(specs)?;
-    info!("forwarding on {} socket(s)", listeners.len());
+    let config = ForwardConfig::default();
+    let bound = forward::bind_all(specs, &config)?;
+    if bound.in_use.is_empty() {
+        info!("forwarding on {} socket(s)", bound.listeners.len());
+    } else {
+        info!(
+            "forwarding on {} socket(s), {} waiting for their port",
+            bound.listeners.len(),
+            bound.in_use.len()
+        );
+    }
 
     tokio::select! {
-        () = forward::serve(listeners, ForwardConfig::default()) => Ok(()),
+        result = forward::serve(bound, config) => Ok(result?),
         () = shutdown.wait() => {
             info!("shutting down");
             Ok(())

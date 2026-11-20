@@ -11,7 +11,13 @@ use tokio::task::JoinSet;
 
 use super::ForwardConfig;
 
-pub(super) async fn run(listener: TcpListener, target: SocketAddr, config: ForwardConfig) {
+/// Accepts and forwards connections. Only returns when the listening socket
+/// itself is lost, with the error that revealed it.
+pub(super) async fn run(
+    listener: TcpListener,
+    target: SocketAddr,
+    config: ForwardConfig,
+) -> io::Error {
     let local = listener.local_addr().ok();
     // Owned here so that dropping the listener task closes its connections.
     let mut connections = JoinSet::new();
@@ -21,18 +27,38 @@ pub(super) async fn run(listener: TcpListener, target: SocketAddr, config: Forwa
             Ok((stream, peer)) => {
                 connections.spawn(handle(stream, peer, target, config));
             }
-            Err(err) if is_transient_accept_error(&err) => {
-                debug!("tcp accept on {local:?}: {err}");
-            }
             Err(err) => {
-                // Typically EMFILE/ENFILE/ENOBUFS: back off instead of spinning.
-                warn!("tcp accept on {local:?} failed: {err}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // Most accept errors concern a single pending connection or a
+                // temporary resource shortage; the listener is only lost if
+                // the kernel no longer considers it listening (e.g. after
+                // `ss -K` or a shutdown).
+                if is_fatal_accept_error(&err)
+                    || !SockRef::from(&listener).is_listener().unwrap_or(false)
+                {
+                    return err;
+                }
+                if is_transient_accept_error(&err) {
+                    debug!("tcp accept on {local:?}: {err}");
+                } else {
+                    // Typically EMFILE/ENFILE/ENOBUFS: back off instead of spinning.
+                    warn!("tcp accept on {local:?} failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }
 }
 
+/// Errors that by definition mean the socket is no longer a usable listener.
+fn is_fatal_accept_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL | libc::EBADF | libc::ENOTSOCK | libc::EFAULT)
+    )
+}
+
+/// Errors that concern only the connection being accepted. accept(2) lists
+/// the network errors that "should be treated like EAGAIN by retrying".
 fn is_transient_accept_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -40,6 +66,18 @@ fn is_transient_accept_error(err: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionRefused
             | io::ErrorKind::Interrupted
+    ) || matches!(
+        err.raw_os_error(),
+        Some(
+            libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
     )
 }
 

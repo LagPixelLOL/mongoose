@@ -182,17 +182,57 @@ fn verbose_enables_debug_logs() {
 }
 
 #[test]
-fn bind_failure_exits_with_error() {
+fn port_in_use_warns_and_keeps_running() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port();
-    let output = mongoose(&["start", &format!("tcp:127.0.0.1:{port}:127.0.0.1:1")]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mongoose"))
+        .args(["start", &format!("tcp:127.0.0.1:{port}:127.0.0.1:1")])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let rule = lines.next().unwrap().unwrap();
+    assert!(rule.contains("rule #1: "), "{rule}");
+    let warning = lines.next().unwrap().unwrap();
+    assert_log_line(&warning, "WARN ");
+    assert!(
+        warning.ends_with(&format!(
+            "port already in use, retrying every 60s: tcp 127.0.0.1:{port} -> 127.0.0.1:1"
+        )),
+        "{warning}"
+    );
+    let mut ready = lines.next().unwrap().unwrap();
+    if ready.contains("ephemeral port range") {
+        assert_log_line(&ready, "WARN ");
+        ready = lines.next().unwrap().unwrap();
+    }
+    assert!(
+        ready.ends_with("forwarding on 0 socket(s), 1 waiting for their port"),
+        "{ready}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(child.try_wait().unwrap().is_none(), "must keep running");
+    sigterm(&child);
+    assert!(wait_with_deadline(&mut child).success());
+}
+
+#[test]
+fn other_bind_errors_exit_with_error() {
+    // 192.0.2.1 (TEST-NET-1) is not a local address.
+    let output = mongoose(&["start", "tcp:192.0.2.1:4000:127.0.0.1:1"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("failed to bind tcp 127.0.0.1:"), "{stderr}");
-    assert!(stderr.contains("Address already in use"), "{stderr}");
+    assert!(
+        stderr.contains("failed to bind tcp 192.0.2.1:4000"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Cannot assign requested address"),
+        "{stderr}"
+    );
     // The cause is reported once, not repeated.
     assert_eq!(
-        stderr.matches("Address already in use").count(),
+        stderr.matches("Cannot assign requested address").count(),
         1,
         "{stderr}"
     );

@@ -31,3 +31,40 @@ pub fn raise_fd_limit() -> std::io::Result<u64> {
     }
     Ok(limit.rlim_cur)
 }
+
+/// Parses `ip_local_port_range` content such as `"32768\t60999"`.
+pub fn parse_port_range_pair(text: &str) -> Option<(u16, u16)> {
+    let mut parts = text.split_whitespace();
+    let start = parts.next()?.parse().ok()?;
+    let end = parts.next()?.parse().ok()?;
+    (parts.next().is_none() && start <= end).then_some((start, end))
+}
+
+/// Parses `ip_local_reserved_ports` content such as `"8080,9000-9100"`.
+pub fn parse_port_list(text: &str) -> Option<Vec<(u16, u16)>> {
+    text.trim()
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(|part| match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (a.parse().ok()?, b.parse().ok()?);
+                (a <= b).then_some((a, b))
+            }
+            None => part.parse().ok().map(|p| (p, p)),
+        })
+        .collect()
+}
+
+/// Returns true if `port` is in the kernel's ephemeral port range and not
+/// reserved, i.e. outgoing connections may temporarily hold it.
+pub fn is_unreserved_ephemeral_port(port: u16) -> bool {
+    let read = |name| std::fs::read_to_string(format!("/proc/sys/net/ipv4/{name}")).ok();
+    let Some((start, end)) = read("ip_local_port_range").and_then(|t| parse_port_range_pair(&t))
+    else {
+        return false;
+    };
+    let reserved = read("ip_local_reserved_ports")
+        .and_then(|t| parse_port_list(&t))
+        .unwrap_or_default();
+    (start..=end).contains(&port) && !reserved.iter().any(|&(a, b)| (a..=b).contains(&port))
+}

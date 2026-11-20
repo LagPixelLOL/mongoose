@@ -161,8 +161,18 @@ fn connect_upstream(target: SocketAddr) -> io::Result<UdpSocket> {
     UdpSocket::from_std(socket)
 }
 
-/// Client -> target direction for one listening socket.
-pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConfig) {
+/// Receive errors that do not mean the listening socket is broken.
+fn is_transient_recv_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Interrupted
+        || matches!(
+            err.raw_os_error(),
+            Some(libc::ENOMEM | libc::ENOBUFS | libc::ECONNREFUSED)
+        )
+}
+
+/// Client -> target direction for one listening socket. Only returns when the
+/// listening socket itself is lost, with the error that revealed it.
+pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConfig) -> io::Error {
     let fwd = Arc::new(UdpForwarder {
         socket,
         target: binding.target,
@@ -175,10 +185,18 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
     let mut sessions = JoinSet::new();
     loop {
         while sessions.try_join_next().is_some() {}
-        if let Err(err) = fwd.socket.readable().await {
-            warn!("udp {}: {err}", binding.local);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
+        // Waiting for ERROR too: a killed socket (`ss -K`) only reports an
+        // error condition, which a plain readable() wait never wakes up for.
+        let ready = match fwd.socket.ready(Interest::READABLE | Interest::ERROR).await {
+            Ok(ready) => ready,
+            Err(err) => return err,
+        };
+        if ready.is_error() || ready.is_read_closed() {
+            // An unconnected UDP socket without IP_RECVERR gets no ICMP
+            // errors, so a pending error means the socket was aborted.
+            return fwd.socket.take_error().ok().flatten().unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::ConnectionAborted, "socket was shut down")
+            });
         }
         // Fast path: receive and forward synchronously while borrowing the
         // shared buffer; only copy the datagram if the send would block.
@@ -188,20 +206,21 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
                 .try_io(Interest::READABLE, || pktinfo::recv_from(fd, buf));
             let (len, peer, source) = match received {
                 Ok(received) => received,
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return None,
-                Err(err) => {
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(err) if is_transient_recv_error(&err) => {
                     debug!("udp {}: receive failed: {err}", binding.local);
-                    return None;
+                    return Ok(None);
                 }
+                Err(err) => return Err(err),
             };
             let session = match fwd.session_for(peer, source, &mut sessions) {
                 Ok(session) => session,
                 Err(err) => {
                     warn!("udp {peer} -> {}: cannot create session: {err}", fwd.target);
-                    return None;
+                    return Ok(None);
                 }
             };
-            match try_send_upstream(&session, &buf[..len]) {
+            Ok(match try_send_upstream(&session, &buf[..len]) {
                 Ok(_) => None,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     Some((session, buf[..len].to_vec()))
@@ -210,8 +229,12 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
                     debug!("udp {peer} -> {}: send failed: {err}", fwd.target);
                     None
                 }
-            }
+            })
         });
+        let pending = match pending {
+            Ok(pending) => pending,
+            Err(err) => return err,
+        };
         if let Some((session, data)) = pending
             && let Err(err) = send_upstream(&session, &data).await
         {

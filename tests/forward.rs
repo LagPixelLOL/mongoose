@@ -1,8 +1,10 @@
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsRawFd;
+use std::sync::{Mutex, Once};
 use std::time::Duration;
 
-use mongoose::forward::{self, BoundListener, ForwardConfig};
+use mongoose::forward::{self, BoundListener, ForwardConfig, ServeError};
 use mongoose::spec::{ForwardSpec, Protocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -21,10 +23,48 @@ fn ipv6_loopback_available() -> bool {
 /// Binds the specs and serves them in the background, returning the bound
 /// listeners' bindings.
 fn start(specs: &[ForwardSpec], config: ForwardConfig) -> Vec<mongoose::spec::Binding> {
-    let listeners = forward::bind_all(specs).unwrap();
-    let bindings = listeners.iter().map(BoundListener::binding).collect();
-    tokio::spawn(forward::serve(listeners, config));
+    let bound = forward::bind_all(specs, &config).unwrap();
+    assert!(bound.in_use.is_empty());
+    let bindings = bound.listeners.iter().map(BoundListener::binding).collect();
+    tokio::spawn(forward::serve(bound, config));
     bindings
+}
+
+static LOGS: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+
+struct CaptureLogger;
+
+impl log::Log for CaptureLogger {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        LOGS.lock()
+            .unwrap()
+            .push((record.level(), record.args().to_string()));
+    }
+
+    fn flush(&self) {}
+}
+
+/// Captures log output of the library. Tests run in parallel, so callers
+/// filter by something unique to them, like a port.
+fn capture_logs() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        log::set_logger(&CaptureLogger).unwrap();
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+}
+
+fn logs_with(level: log::Level, needle: &str) -> Vec<String> {
+    LOGS.lock()
+        .unwrap()
+        .iter()
+        .filter(|(l, msg)| *l == level && msg.contains(needle))
+        .map(|(_, msg)| msg.clone())
+        .collect()
 }
 
 fn first(bindings: &[mongoose::spec::Binding], protocol: Protocol) -> SocketAddr {
@@ -100,10 +140,14 @@ async fn expect_reset(addr: SocketAddr) {
 }
 
 /// Finds `count` consecutive ports free for both TCP and UDP on 127.0.0.1.
+/// Searches below the kernel's ephemeral range (32768+) so client sockets of
+/// concurrently running tests are unlikely to take them in the meantime.
 fn free_port_range(count: u16) -> u16 {
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     let seed = (std::process::id() as u16).wrapping_mul(7919);
-    'outer: for attempt in 0..200u16 {
-        let base = 20_000 + (seed.wrapping_add(attempt.wrapping_mul(97)) % 30_000);
+    'outer: for _ in 0..200u16 {
+        let attempt = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = 10_000 + (seed.wrapping_add(attempt.wrapping_mul(97)) % 22_000);
         let mut held = Vec::new();
         for port in base..base + count {
             let tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port));
@@ -290,16 +334,23 @@ async fn port_ranges_map_one_to_one() {
         });
         udp_echo(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
     }
-    // Picked after the targets are bound, so the ranges cannot overlap.
-    let local = free_port_range(3);
-    start(
-        &[spec(&format!(
-            "127.0.0.1:{}-{}:127.0.0.1:{target}",
-            local,
+    // Picked after the targets are bound, so the ranges cannot overlap. A
+    // concurrently running test may grab one of the ports right before we
+    // bind; pick another range then.
+    let config = ForwardConfig::default();
+    let mut local = 0;
+    for _ in 0..10 {
+        local = free_port_range(3);
+        let rule = spec(&format!(
+            "127.0.0.1:{local}-{}:127.0.0.1:{target}",
             local + 2
-        ))],
-        ForwardConfig::default(),
-    );
+        ));
+        let bound = forward::bind_all(&[rule], &config).unwrap();
+        if bound.in_use.is_empty() {
+            tokio::spawn(forward::serve(bound, config));
+            break;
+        }
+    }
     for offset in 0..3 {
         let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, local + offset))
             .await
@@ -513,11 +564,20 @@ async fn udp_unreachable_target_keeps_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ipv6_listeners_are_ipv6_only() {
-    // Binding [::] must not take the IPv4 port as well.
-    let v6 = forward::bind_all(&[spec("tcp:[::]:0:127.0.0.1:1")]).unwrap();
-    let port = v6[0].local_addr().port();
-    let v4 = forward::bind_all(&[spec(&format!("tcp:0.0.0.0:{port}:127.0.0.1:1"))]);
-    assert!(v4.is_ok(), "{:?}", v4.err());
+    // Binding [::] must not take the IPv4 port as well. Another test may
+    // happen to hold the same port number on IPv4, so try a few ports; if
+    // [::] were not IPv6-only, every attempt would fail.
+    let config = ForwardConfig::default();
+    for _ in 0..20 {
+        let v6 = forward::bind_all(&[spec("tcp:[::]:0:127.0.0.1:1")], &config).unwrap();
+        let port = v6.listeners[0].local_addr().port();
+        let v4 = forward::bind_all(&[spec(&format!("tcp:0.0.0.0:{port}:127.0.0.1:1"))], &config)
+            .unwrap();
+        if v4.listeners.len() == 1 {
+            return;
+        }
+    }
+    panic!("binding [::] also took the IPv4 port");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -592,20 +652,244 @@ async fn ipv6_udp_wildcard() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bind_failure_releases_everything() {
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let taken_port = taken.local_addr().unwrap().port();
+async fn non_in_use_bind_error_is_fatal_and_releases_everything() {
     let free = free_port_range(1);
-    let err = forward::bind_all(&[
-        spec(&format!("tcp:127.0.0.1:{free}:127.0.0.1:1")),
-        spec(&format!("tcp:127.0.0.1:{taken_port}:127.0.0.1:1")),
-    ])
+    // 192.0.2.1 (TEST-NET-1) is not a local address: EADDRNOTAVAIL.
+    let err = forward::bind_all(
+        &[
+            spec(&format!("tcp:127.0.0.1:{free}:127.0.0.1:1")),
+            spec(&format!("tcp:192.0.2.1:{free}:127.0.0.1:1")),
+        ],
+        &ForwardConfig::default(),
+    )
     .err()
     .expect("bind must fail");
-    assert_eq!(err.binding.local.port(), taken_port);
-    assert_eq!(err.source.kind(), ErrorKind::AddrInUse);
+    assert!(!err.is_addr_in_use());
+    assert_eq!(err.source.kind(), ErrorKind::AddrNotAvailable);
     // The socket bound before the failure was released again.
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, free)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_use_ports_are_retried_until_free() {
+    capture_logs();
+    let tcp_target = tcp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let udp_target = udp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let port = free_port_range(1);
+    let tcp_blocker = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let udp_blocker = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let config = ForwardConfig {
+        bind_retry_interval: Duration::from_millis(50),
+        ..ForwardConfig::default()
+    };
+    let bound = forward::bind_all(
+        &[
+            spec(&format!(
+                "tcp:127.0.0.1:{port}:127.0.0.1:{}",
+                tcp_target.port()
+            )),
+            spec(&format!(
+                "udp:127.0.0.1:{port}:127.0.0.1:{}",
+                udp_target.port()
+            )),
+        ],
+        &config,
+    )
+    .unwrap();
+    assert!(bound.listeners.is_empty());
+    assert_eq!(bound.in_use.len(), 2);
+    let needle = format!("127.0.0.1:{port} ->");
+    let startup = logs_with(log::Level::Warn, &needle);
+    assert_eq!(startup.len(), 1, "{startup:?}");
+    assert!(
+        startup[0].starts_with("port already in use, retrying every 50ms: "),
+        "{startup:?}"
+    );
+    assert!(
+        startup[0].contains(&format!("tcp 127.0.0.1:{port} ->")),
+        "{startup:?}"
+    );
+    assert!(
+        startup[0].contains(&format!("udp 127.0.0.1:{port} ->")),
+        "{startup:?}"
+    );
+
+    let serve = tokio::spawn(forward::serve(bound, config));
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    let retries = logs_with(log::Level::Warn, &needle);
+    assert!(retries.len() >= 2, "{retries:?}");
+    assert!(
+        retries[1].starts_with("port still in use, retrying in 50ms: "),
+        "{retries:?}"
+    );
+    assert!(!serve.is_finished());
+
+    drop(tcp_blocker);
+    drop(udp_blocker);
+    let mut client = None;
+    for _ in 0..100 {
+        if !logs_with(log::Level::Info, &needle).is_empty() {
+            client = Some(
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .unwrap(),
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut client = client.expect("bound after the port was freed");
+    let bound_logs = logs_with(log::Level::Info, &needle);
+    assert_eq!(bound_logs.len(), 1, "{bound_logs:?}");
+    assert!(
+        bound_logs[0].starts_with("bound after retry: "),
+        "{bound_logs:?}"
+    );
+
+    client.write_all(b"retried").await.unwrap();
+    let mut buf = [0u8; 7];
+    timeout(WAIT, client.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"retried");
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    assert_eq!(udp_roundtrip(&udp, b"retried").await.1, b"retried");
+    // Nothing is retried any more.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(
+        logs_with(log::Level::Warn, &needle).len(),
+        retries_until_bound(&needle)
+    );
+    serve.abort();
+}
+
+/// Number of in-use warnings logged before the successful retry.
+fn retries_until_bound(needle: &str) -> usize {
+    let logs = LOGS.lock().unwrap();
+    let bound_at = logs
+        .iter()
+        .position(|(l, m)| *l == log::Level::Info && m.contains(needle))
+        .unwrap();
+    logs[..bound_at]
+        .iter()
+        .filter(|(l, m)| *l == log::Level::Warn && m.contains(needle))
+        .count()
+}
+
+/// Whether shutting down a socket wakes a waiter that is already blocked in
+/// an edge-triggered epoll (what Tokio does) with a hang-up indication. Some
+/// sandboxes (e.g. gVisor) do not, so a killed socket is only noticed on its
+/// next use there.
+fn shutdown_wakes_waiter(fd: std::os::fd::RawFd, how: libc::c_int) -> bool {
+    // SAFETY: plain epoll/shutdown syscalls on descriptors we own.
+    unsafe {
+        let epoll = libc::epoll_create1(libc::EPOLL_CLOEXEC);
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+            u64: 0,
+        };
+        libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, fd, &mut event);
+        let mut out = [libc::epoll_event { events: 0, u64: 0 }];
+        libc::epoll_wait(epoll, out.as_mut_ptr(), 1, 0);
+        libc::shutdown(fd, how);
+        let woken = libc::epoll_wait(epoll, out.as_mut_ptr(), 1, 100) > 0;
+        libc::close(epoll);
+        // Linux reports the shutdown as a hang-up; a plain "readable" event
+        // is indistinguishable from a spurious wakeup.
+        let hangup = (libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR) as u32;
+        woken && out[0].events & hangup != 0
+    }
+}
+
+fn tcp_shutdown_wakes_waiter() -> bool {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    shutdown_wakes_waiter(listener.as_raw_fd(), libc::SHUT_RD)
+}
+
+fn udp_shutdown_wakes_waiter() -> bool {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    shutdown_wakes_waiter(socket.as_raw_fd(), libc::SHUT_RDWR)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_tcp_listener_stops_serve() {
+    if !tcp_shutdown_wakes_waiter() {
+        eprintln!("skipping: platform does not wake waiters on listener shutdown");
+        return;
+    }
+    let config = ForwardConfig::default();
+    let bound = forward::bind_all(
+        &[
+            spec("tcp:127.0.0.1:0:127.0.0.1:1"),
+            spec("tcp:127.0.0.1:0:127.0.0.1:2"),
+        ],
+        &config,
+    )
+    .unwrap();
+    let victim = bound.listeners[1].binding();
+    let fd = bound.listeners[1].as_raw_fd();
+    let serve = tokio::spawn(forward::serve(bound, config));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // SAFETY: shutdown(2) on a socket owned by the running forwarder.
+    unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+    let result = timeout(WAIT, serve)
+        .await
+        .expect("serve must stop")
+        .unwrap();
+    match result {
+        Err(ServeError::ListenerLost { binding, .. }) => assert_eq!(binding, victim),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_udp_listener_stops_serve() {
+    if !udp_shutdown_wakes_waiter() {
+        eprintln!("skipping: platform does not wake waiters on socket shutdown");
+        return;
+    }
+    let config = ForwardConfig::default();
+    let bound = forward::bind_all(
+        &[
+            spec("udp:127.0.0.1:0:127.0.0.1:1"),
+            spec("udp:127.0.0.1:0:127.0.0.1:2"),
+        ],
+        &config,
+    )
+    .unwrap();
+    let victim = bound.listeners[0].binding();
+    let fd = bound.listeners[0].as_raw_fd();
+    let serve = tokio::spawn(forward::serve(bound, config));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // SAFETY: shutdown(2) on a socket owned by the running forwarder.
+    unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    let result = timeout(WAIT, serve)
+        .await
+        .expect("serve must stop")
+        .unwrap();
+    match result {
+        Err(ServeError::ListenerLost { binding, .. }) => assert_eq!(binding, victim),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn bindings_are_described_compactly() {
+    let bindings: Vec<_> = [
+        spec("tcp:0.0.0.0:80-82:10.0.0.1:8080"),
+        spec("udp:[::]:53:[2001:db8::1]:53"),
+        spec("tcp:0.0.0.0:90:10.0.0.1:9000"),
+    ]
+    .iter()
+    .flat_map(ForwardSpec::bindings)
+    .collect();
+    assert_eq!(
+        forward::describe_bindings(&bindings),
+        "tcp 0.0.0.0:80-82 -> 10.0.0.1:8080-8082, tcp 0.0.0.0:90 -> 10.0.0.1:9000, \
+         udp [::]:53 -> [2001:db8::1]:53"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -636,14 +920,18 @@ async fn many_concurrent_tcp_connections() {
 async fn dropping_serve_releases_all_sockets() {
     let tcp_target = tcp_echo("127.0.0.1:0".parse().unwrap()).await;
     let udp_target = udp_echo("127.0.0.1:0".parse().unwrap()).await;
-    let listeners = forward::bind_all(&[
-        spec(&format!("tcp:127.0.0.1:0:127.0.0.1:{}", tcp_target.port())),
-        spec(&format!("udp:127.0.0.1:0:127.0.0.1:{}", udp_target.port())),
-    ])
+    let config = ForwardConfig::default();
+    let bound = forward::bind_all(
+        &[
+            spec(&format!("tcp:127.0.0.1:0:127.0.0.1:{}", tcp_target.port())),
+            spec(&format!("udp:127.0.0.1:0:127.0.0.1:{}", udp_target.port())),
+        ],
+        &config,
+    )
     .unwrap();
-    let tcp_addr = listeners[0].local_addr();
-    let udp_addr = listeners[1].local_addr();
-    let handle = tokio::spawn(forward::serve(listeners, ForwardConfig::default()));
+    let tcp_addr = bound.listeners[0].local_addr();
+    let udp_addr = bound.listeners[1].local_addr();
+    let handle = tokio::spawn(forward::serve(bound, config));
 
     let mut tcp = TcpStream::connect(tcp_addr).await.unwrap();
     tcp.write_all(b"hi").await.unwrap();

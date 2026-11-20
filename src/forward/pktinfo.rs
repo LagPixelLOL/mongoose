@@ -84,6 +84,13 @@ pub(super) fn recv_from(
     if len < 0 {
         return Err(io::Error::last_os_error());
     }
+    if msg.msg_namelen == 0 {
+        // Only a shut down socket "receives" without a sender.
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "socket was shut down",
+        ));
+    }
     // SAFETY: the kernel initialised msg_namelen bytes of addr.
     let peer = unsafe { SockAddr::new(addr, msg.msg_namelen) }
         .as_socket()
