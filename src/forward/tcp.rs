@@ -7,15 +7,19 @@ use std::time::Duration;
 use log::{debug, warn};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
 use super::ForwardConfig;
 
 pub(super) async fn run(listener: TcpListener, target: SocketAddr, config: ForwardConfig) {
     let local = listener.local_addr().ok();
+    // Owned here so that dropping the listener task closes its connections.
+    let mut connections = JoinSet::new();
     loop {
+        while connections.try_join_next().is_some() {}
         match listener.accept().await {
             Ok((stream, peer)) => {
-                tokio::spawn(handle(stream, peer, target, config));
+                connections.spawn(handle(stream, peer, target, config));
             }
             Err(err) if is_transient_accept_error(&err) => {
                 debug!("tcp accept on {local:?}: {err}");

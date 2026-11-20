@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use log::{debug, warn};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
 
 use super::ForwardConfig;
 use super::pktinfo::{self, LocalDst};
@@ -66,13 +67,14 @@ impl UdpForwarder {
             .saturating_sub(session.last_active_ms.load(Ordering::Relaxed))
     }
 
-    /// Returns the session for a client, creating it if needed. The activity
-    /// timestamp is refreshed under the lock so a concurrent idle check cannot
-    /// expire a session that is about to be used.
+    /// Returns the session for a client, creating it (and its reply task in
+    /// `tasks`) if needed. The activity timestamp is refreshed under the lock
+    /// so a concurrent idle check cannot expire a session about to be used.
     fn session_for(
         self: &Arc<Self>,
         peer: SocketAddr,
         source: Option<LocalDst>,
+        tasks: &mut JoinSet<()>,
     ) -> io::Result<Arc<Session>> {
         let key = (peer, source.map(|s| s.ip));
         let mut sessions = self.sessions.lock().unwrap();
@@ -92,7 +94,7 @@ impl UdpForwarder {
             self.target,
             session.upstream.local_addr()
         );
-        tokio::spawn(run_replies(self.clone(), key, session.clone()));
+        tasks.spawn(run_replies(self.clone(), key, session.clone()));
         Ok(session)
     }
 
@@ -169,7 +171,10 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
         idle_ms: config.udp_idle_timeout.as_millis().max(1) as u64,
     });
     let fd = fwd.socket.as_raw_fd();
+    // Owned here so that dropping the listener task ends all its sessions.
+    let mut sessions = JoinSet::new();
     loop {
+        while sessions.try_join_next().is_some() {}
         if let Err(err) = fwd.socket.readable().await {
             warn!("udp {}: {err}", binding.local);
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -189,7 +194,7 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
                     return None;
                 }
             };
-            let session = match fwd.session_for(peer, source) {
+            let session = match fwd.session_for(peer, source, &mut sessions) {
                 Ok(session) => session,
                 Err(err) => {
                     warn!("udp {peer} -> {}: cannot create session: {err}", fwd.target);

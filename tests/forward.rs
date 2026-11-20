@@ -618,3 +618,46 @@ async fn many_concurrent_tcp_connections() {
         timeout(WAIT, task).await.unwrap().unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_serve_releases_all_sockets() {
+    let tcp_target = tcp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let udp_target = udp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let listeners = forward::bind_all(&[
+        spec(&format!("tcp:127.0.0.1:0:127.0.0.1:{}", tcp_target.port())),
+        spec(&format!("udp:127.0.0.1:0:127.0.0.1:{}", udp_target.port())),
+    ])
+    .unwrap();
+    let tcp_addr = listeners[0].local_addr();
+    let udp_addr = listeners[1].local_addr();
+    let handle = tokio::spawn(forward::serve(listeners, ForwardConfig::default()));
+
+    let mut tcp = TcpStream::connect(tcp_addr).await.unwrap();
+    tcp.write_all(b"hi").await.unwrap();
+    let mut buf = [0u8; 2];
+    timeout(WAIT, tcp.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.connect(udp_addr).await.unwrap();
+    udp_roundtrip(&udp, b"session").await;
+
+    handle.abort();
+    let _ = handle.await;
+
+    // The open connection is closed and both ports can be bound again.
+    let read = timeout(WAIT, tcp.read(&mut buf)).await.unwrap();
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let mut rebound = false;
+    for _ in 0..50 {
+        if std::net::UdpSocket::bind(udp_addr).is_ok()
+            && std::net::TcpListener::bind(tcp_addr).is_ok()
+        {
+            rebound = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(rebound, "sockets still bound after serve was dropped");
+}
