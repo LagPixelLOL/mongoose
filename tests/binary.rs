@@ -1,7 +1,27 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+/// Waits for the child, killing it and failing the test if it takes too long.
+fn wait_with_deadline(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("mongoose did not exit in time");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn sigterm(child: &Child) {
+    // SAFETY: plain kill(2) on our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+}
 
 fn mongoose(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_mongoose"))
@@ -127,9 +147,8 @@ fn start_logs_rules_forwards_and_stops_on_sigterm() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"ping");
 
-    // SAFETY: plain kill(2) on our own child.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    let status = child.wait().unwrap();
+    sigterm(&child);
+    let status = wait_with_deadline(&mut child);
     assert!(status.success(), "{status}");
     let rest: Vec<String> = lines.map(Result::unwrap).collect();
     assert!(
@@ -157,9 +176,8 @@ fn verbose_enables_debug_logs() {
             break;
         }
     }
-    // SAFETY: plain kill(2) on our own child.
-    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-    child.wait().unwrap();
+    sigterm(&child);
+    assert!(wait_with_deadline(&mut child).success());
     assert!(saw_debug);
 }
 
@@ -178,4 +196,23 @@ fn bind_failure_exits_with_error() {
         1,
         "{stderr}"
     );
+}
+
+#[test]
+fn sigterm_right_after_startup_is_not_lost() {
+    for _ in 0..10 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mongoose"))
+            .args(["start", "tcp:127.0.0.1:0:127.0.0.1:9"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(child.stderr.take().unwrap()).lines();
+        for line in lines {
+            if line.unwrap().contains("forwarding on") {
+                break;
+            }
+        }
+        sigterm(&child);
+        assert!(wait_with_deadline(&mut child).success());
+    }
 }

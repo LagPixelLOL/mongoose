@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use mongoose::cli::{Cli, Command};
 use mongoose::forward::{self, ForwardConfig};
@@ -39,6 +40,9 @@ fn log_rules(specs: &[ForwardSpec]) {
 }
 
 async fn start(specs: &[ForwardSpec]) -> Result<()> {
+    // Listen for signals before binding anything: a SIGTERM that arrives
+    // between handler installation and subscription would otherwise be lost.
+    let mut shutdown = Shutdown::install()?;
     conflict::check(specs)?;
     log_rules(specs);
 
@@ -51,20 +55,31 @@ async fn start(specs: &[ForwardSpec]) -> Result<()> {
 
     tokio::select! {
         () = forward::serve(listeners, ForwardConfig::default()) => Ok(()),
-        signal = shutdown_signal() => {
-            signal?;
+        () = shutdown.wait() => {
             info!("shutting down");
             Ok(())
         }
     }
 }
 
-async fn shutdown_signal() -> Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C"),
-        _ = terminate.recv() => Ok(()),
+struct Shutdown {
+    terminate: Signal,
+    interrupt: Signal,
+}
+
+impl Shutdown {
+    fn install() -> Result<Self> {
+        Ok(Self {
+            terminate: signal(SignalKind::terminate()).context("installing SIGTERM handler")?,
+            interrupt: signal(SignalKind::interrupt()).context("installing SIGINT handler")?,
+        })
+    }
+
+    async fn wait(&mut self) {
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
     }
 }
 
