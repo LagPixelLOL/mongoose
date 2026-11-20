@@ -1,11 +1,11 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 use mongoose::cli::{Cli, Command};
 use mongoose::forward::{self, ForwardConfig};
-use mongoose::service::{DEFAULT_UNIT_DIR, HostSystem, ServiceManager, SetupOutcome};
+use mongoose::service::{ServiceManager, SetupOutcome};
 use mongoose::spec::ForwardSpec;
 use mongoose::{conflict, logging, sys};
 
@@ -20,6 +20,7 @@ async fn main() -> ExitCode {
             skip_enable, specs, ..
         } => setup(&specs, skip_enable),
         Command::Remove { .. } => remove(),
+        Command::Show { .. } => show(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -30,17 +31,23 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Logs the fully expanded rules, one line per rule.
+fn log_rules(specs: &[ForwardSpec]) {
+    for (index, spec) in specs.iter().enumerate() {
+        info!("rule #{}: {}", index + 1, spec.describe());
+    }
+}
+
 async fn start(specs: &[ForwardSpec]) -> Result<()> {
     conflict::check(specs)?;
+    log_rules(specs);
+
     match sys::raise_fd_limit() {
-        Ok(limit) => log::debug!("open file limit: {limit}"),
+        Ok(limit) => debug!("open file limit: {limit}"),
         Err(err) => warn!("could not raise open file limit: {err}"),
     }
-
     let listeners = forward::bind_all(specs)?;
-    for spec in specs {
-        info!("forwarding {spec}");
-    }
+    info!("forwarding on {} socket(s)", listeners.len());
 
     tokio::select! {
         () = forward::serve(listeners, ForwardConfig::default()) => Ok(()),
@@ -63,8 +70,11 @@ async fn shutdown_signal() -> Result<()> {
 
 fn setup(specs: &[ForwardSpec], skip_enable: bool) -> Result<()> {
     conflict::check(specs)?;
+    // The unit runs the binary from where it is now; it is never copied or moved.
     let exe = std::env::current_exe().context("cannot determine the mongoose executable path")?;
-    let manager = ServiceManager::new(HostSystem, DEFAULT_UNIT_DIR);
+    let manager = ServiceManager::host();
+    manager.precheck_setup(&exe)?;
+    log_rules(specs);
     match manager.setup(&exe, specs, skip_enable)? {
         SetupOutcome::Installed => info!("setup complete"),
         SetupOutcome::Replaced => info!("setup complete (replaced previous unit)"),
@@ -73,7 +83,12 @@ fn setup(specs: &[ForwardSpec], skip_enable: bool) -> Result<()> {
 }
 
 fn remove() -> Result<()> {
-    ServiceManager::new(HostSystem, DEFAULT_UNIT_DIR).remove()?;
+    ServiceManager::host().remove()?;
     info!("mongoose service removed");
+    Ok(())
+}
+
+fn show() -> Result<()> {
+    println!("{}", ServiceManager::host().show()?);
     Ok(())
 }

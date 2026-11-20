@@ -182,6 +182,56 @@ impl ForwardSpec {
     }
 }
 
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
+    }
+}
+
+impl ForwardSpec {
+    /// Number of listening sockets this spec creates.
+    pub fn listener_count(&self) -> usize {
+        self.protocols.list().len()
+            * self.local_addr.ips().len()
+            * self.local_ports.count() as usize
+    }
+
+    /// One-line, fully expanded description of what this spec does, e.g.
+    /// `tcp+udp 0.0.0.0:80-81, [::]:80-81 -> 10.0.0.1:8080-8081 (2 ports, 8 sockets)`.
+    pub fn describe(&self) -> String {
+        let protocols = match self.protocols {
+            Protocols::Tcp => "tcp",
+            Protocols::Udp => "udp",
+            Protocols::Both => "tcp+udp",
+        };
+        let locals: Vec<String> = self
+            .local_addr
+            .ips()
+            .into_iter()
+            .map(|ip| match ip {
+                IpAddr::V4(v4) => format!("{v4}:{}", self.local_ports),
+                IpAddr::V6(v6) => format!("[{v6}]:{}", self.local_ports),
+            })
+            .collect();
+        let target = match self.target_ip {
+            IpAddr::V4(v4) => format!("{v4}:{}", self.target_ports),
+            IpAddr::V6(v6) => format!("[{v6}]:{}", self.target_ports),
+        };
+        let ports = if self.local_ports.start() == 0 {
+            "ephemeral local port".to_string()
+        } else {
+            plural(self.local_ports.count() as usize, "port")
+        };
+        format!(
+            "{protocols} {} -> {target} ({ports}, {})",
+            locals.join(", "),
+            plural(self.listener_count(), "socket")
+        )
+    }
+}
+
 impl fmt::Display for ForwardSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.protocols {

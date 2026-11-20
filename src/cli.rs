@@ -63,6 +63,11 @@ pub enum Command {
         #[command(flatten)]
         verbose: Verbose,
     },
+    /// Show the rules and state of the systemd service created by `setup`
+    Show {
+        #[command(flatten)]
+        verbose: Verbose,
+    },
 }
 
 impl Command {
@@ -70,7 +75,8 @@ impl Command {
         match self {
             Command::Start { verbose, .. }
             | Command::Setup { verbose, .. }
-            | Command::Remove { verbose } => *verbose,
+            | Command::Remove { verbose }
+            | Command::Show { verbose } => *verbose,
         }
     }
 }
