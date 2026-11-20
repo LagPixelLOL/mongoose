@@ -7,7 +7,7 @@ use mongoose::cli::{Cli, Command};
 use mongoose::forward::{self, ForwardConfig};
 use mongoose::service::{DEFAULT_UNIT_DIR, HostSystem, ServiceManager, SetupOutcome};
 use mongoose::spec::ForwardSpec;
-use mongoose::{logging, sys};
+use mongoose::{conflict, logging, sys};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -31,6 +31,7 @@ async fn main() -> ExitCode {
 }
 
 async fn start(specs: &[ForwardSpec]) -> Result<()> {
+    conflict::check(specs)?;
     match sys::raise_fd_limit() {
         Ok(limit) => log::debug!("open file limit: {limit}"),
         Err(err) => warn!("could not raise open file limit: {err}"),
@@ -61,6 +62,7 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 fn setup(specs: &[ForwardSpec], skip_enable: bool) -> Result<()> {
+    conflict::check(specs)?;
     let exe = std::env::current_exe().context("cannot determine the mongoose executable path")?;
     let manager = ServiceManager::new(HostSystem, DEFAULT_UNIT_DIR);
     match manager.setup(&exe, specs, skip_enable)? {

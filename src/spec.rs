@@ -17,7 +17,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// Transport protocol of a single forwarding binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -199,7 +199,7 @@ impl fmt::Display for ForwardSpec {
 pub enum SpecError {
     #[error("expected [tcp:|udp:]LOCAL_IP:LOCAL_PORT:TARGET_IP:TARGET_PORT")]
     Format,
-    #[error("unknown protocol '{0}' (expected tcp or udp)")]
+    #[error("unknown protocol '{0}' (expected lowercase tcp or udp)")]
     UnknownProtocol(String),
     #[error("invalid {role} address '{value}'")]
     InvalidAddress { role: &'static str, value: String },
@@ -209,6 +209,18 @@ pub enum SpecError {
     BracketedNonIpv6(String),
     #[error("'*' is not allowed as the target address")]
     WildcardTarget,
+    #[error("IPv4-mapped IPv6 {role} address '[{value}]' is not allowed; use {mapped} instead")]
+    MappedIpv6 {
+        role: &'static str,
+        value: Ipv6Addr,
+        mapped: Ipv4Addr,
+    },
+    #[error("{kind} address {value} cannot be used as the {role} address")]
+    UnusableAddress {
+        role: &'static str,
+        kind: &'static str,
+        value: IpAddr,
+    },
     #[error("invalid {role} port '{value}'")]
     InvalidPort { role: &'static str, value: String },
     #[error("invalid {role} port range '{value}': start must not be greater than end")]
@@ -240,7 +252,9 @@ pub fn parse(input: &str) -> Result<ForwardSpec, SpecError> {
     let local_addr = if local_host.text == "*" && !local_host.bracketed {
         LocalAddr::Any
     } else {
-        LocalAddr::Ip(parse_ip(&local_host, "local")?)
+        let ip = parse_ip(&local_host, "local")?;
+        check_ip(ip, "local")?;
+        LocalAddr::Ip(ip)
     };
 
     let (local_port_text, rest) = rest.split_once(':').ok_or(SpecError::Format)?;
@@ -251,6 +265,7 @@ pub fn parse(input: &str) -> Result<ForwardSpec, SpecError> {
         return Err(SpecError::WildcardTarget);
     }
     let target_ip = parse_ip(&target_host, "target")?;
+    check_ip(target_ip, "target")?;
     if target_port_text.contains(':') {
         return Err(SpecError::Format);
     }
@@ -287,11 +302,10 @@ pub fn parse(input: &str) -> Result<ForwardSpec, SpecError> {
 
 fn split_protocol(input: &str) -> Result<(Protocols, &str), SpecError> {
     if let Some((head, rest)) = input.split_once(':') {
-        if head.eq_ignore_ascii_case("tcp") {
-            return Ok((Protocols::Tcp, rest));
-        }
-        if head.eq_ignore_ascii_case("udp") {
-            return Ok((Protocols::Udp, rest));
+        match head {
+            "tcp" => return Ok((Protocols::Tcp, rest)),
+            "udp" => return Ok((Protocols::Udp, rest)),
+            _ => {}
         }
         // Something alphabetic that is not an IPv4 address or `*` can only be
         // an attempt at a protocol prefix.
@@ -382,8 +396,42 @@ fn parse_ip(host: &Host<'_>, role: &'static str) -> Result<IpAddr, SpecError> {
         })
 }
 
+/// Rejects addresses that cannot be bound or connected to as a plain unicast
+/// endpoint. The unspecified address is only meaningful for local binds.
+fn check_ip(ip: IpAddr, role: &'static str) -> Result<(), SpecError> {
+    let unusable = |kind| SpecError::UnusableAddress {
+        role,
+        kind,
+        value: ip,
+    };
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return Err(SpecError::MappedIpv6 {
+                    role,
+                    value: v6,
+                    mapped,
+                });
+            }
+        }
+        IpAddr::V4(v4) => {
+            if v4.is_broadcast() {
+                return Err(unusable("broadcast"));
+            }
+        }
+    }
+    if ip.is_multicast() {
+        return Err(unusable("multicast"));
+    }
+    if role == "target" && ip.is_unspecified() {
+        return Err(unusable("unspecified"));
+    }
+    Ok(())
+}
+
 fn parse_port(text: &str, role: &'static str) -> Result<u16, SpecError> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+    let leading_zero = text.len() > 1 && text.starts_with('0');
+    if text.is_empty() || leading_zero || !text.bytes().all(|b| b.is_ascii_digit()) {
         return Err(SpecError::InvalidPort {
             role,
             value: text.to_string(),
