@@ -230,6 +230,7 @@ pub fn render_unit(exe: &Path, specs: &[ForwardSpec]) -> String {
          Description=Mongoose port forwarder\n\
          Wants=network-online.target\n\
          After=network-online.target\n\
+         StartLimitIntervalSec=0\n\
          \n\
          [Service]\n\
          ExecStart={}\n\

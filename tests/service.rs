@@ -187,6 +187,7 @@ fn unit_contains_only_non_defaults() {
              Description=Mongoose port forwarder\n\
              Wants=network-online.target\n\
              After=network-online.target\n\
+             StartLimitIntervalSec=0\n\
              \n\
              [Service]\n\
              ExecStart=/usr/local/bin/mongoose start tcp:*:80:10.0.0.1:80 udp:[::]:53:[2001:db8::1]:53\n\

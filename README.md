@@ -128,6 +128,7 @@ unit only contains settings that differ from systemd's defaults:
 Description=Mongoose port forwarder
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/local/bin/mongoose start *:8080:10.0.0.5:80
@@ -138,7 +139,9 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-The first line marks the unit as written by `setup`.
+The first line marks the unit as written by `setup`. `StartLimitIntervalSec=0`
+turns off systemd's start rate limit, so a failing service keeps being
+restarted every 3 seconds instead of eventually being given up on.
 
 - **Where the unit goes:** if a `mongoose.service` already exists anywhere in
   systemd's search path, `setup` replaces that file in place. Otherwise it
