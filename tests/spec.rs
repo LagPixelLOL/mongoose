@@ -334,26 +334,64 @@ fn bindings_expand_everything() {
         protocol: Protocol::Udp,
         local: addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 101),
         target: addr(v4(10, 0, 0, 1), 201),
+        ipv6_only: true,
     }));
     assert!(bindings.contains(&Binding {
         protocol: Protocol::Tcp,
         local: addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 100),
         target: addr(v4(10, 0, 0, 1), 200),
+        ipv6_only: false,
     }));
+}
+
+#[test]
+fn only_the_wildcard_ipv6_half_is_forced_ipv6_only() {
+    let forced = |input: &str| -> Vec<bool> {
+        parse(input)
+            .unwrap()
+            .bindings()
+            .iter()
+            .map(|b| b.ipv6_only)
+            .collect()
+    };
+    assert_eq!(forced("tcp:*:80:10.0.0.1:80"), vec![false, true]);
+    assert_eq!(forced("tcp:[::]:80:10.0.0.1:80"), vec![false]);
+    assert_eq!(forced("tcp:[2001:db8::1]:80:10.0.0.1:80"), vec![false]);
+    assert_eq!(forced("tcp:0.0.0.0:80:10.0.0.1:80"), vec![false]);
 }
 
 #[test]
 fn describe_is_one_expanded_line() {
     assert_eq!(
-        parse("*:80-81:10.0.0.1:8080").unwrap().describe(),
+        parse("*:80-81:10.0.0.1:8080").unwrap().describe(true),
         "tcp+udp 0.0.0.0:80-81, [::]:80-81 -> 10.0.0.1:8080-8081 (2 ports, 8 sockets)"
     );
     assert_eq!(
-        parse("tcp:127.0.0.1:0:[::1]:22").unwrap().describe(),
+        parse("tcp:127.0.0.1:0:[::1]:22").unwrap().describe(true),
         "tcp 127.0.0.1:0 -> [::1]:22 (ephemeral local port, 1 socket)"
     );
     assert_eq!(
-        parse("udp:[::]:53:1.1.1.1:53").unwrap().describe(),
-        "udp [::]:53 -> 1.1.1.1:53 (1 port, 1 socket)"
+        parse("udp:[2001:db8::1]:53:1.1.1.1:53")
+            .unwrap()
+            .describe(true),
+        "udp [2001:db8::1]:53 -> 1.1.1.1:53 (1 port, 1 socket)"
+    );
+}
+
+#[test]
+fn describe_states_the_ipv6_default_for_explicit_unspecified() {
+    let spec = parse("udp:[::]:53:1.1.1.1:53").unwrap();
+    assert_eq!(
+        spec.describe(true),
+        "udp [::]:53 (dual-stack, also IPv4 per system default) -> 1.1.1.1:53 (1 port, 1 socket)"
+    );
+    assert_eq!(
+        spec.describe(false),
+        "udp [::]:53 (IPv6 only per system default) -> 1.1.1.1:53 (1 port, 1 socket)"
+    );
+    // The wildcard's IPv6 half never follows the default.
+    assert_eq!(
+        parse("udp:*:53:1.1.1.1:53").unwrap().describe(true),
+        "udp 0.0.0.0:53, [::]:53 -> 1.1.1.1:53 (1 port, 2 sockets)"
     );
 }

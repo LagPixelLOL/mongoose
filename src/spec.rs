@@ -3,7 +3,10 @@
 //! Format: `[tcp:|udp:]LOCAL_IP:LOCAL_PORT:TARGET_IP:TARGET_PORT`
 //!
 //! * Without a protocol prefix both TCP and UDP are forwarded.
-//! * `LOCAL_IP` may be `*`, which binds both `0.0.0.0` and `[::]`.
+//! * `LOCAL_IP` may be `*`, which binds both `0.0.0.0` and `[::]` (the latter
+//!   IPv6-only so the two can coexist). Any other IPv6 bind, including an
+//!   explicit `[::]`, keeps the system's default dual-stack behaviour
+//!   (`net.ipv6.bindv6only`).
 //! * IPv6 addresses must be wrapped in brackets, e.g. `[::1]`.
 //! * Ports are either a single number or an inclusive range `START-END`.
 //!   Port `0` (ephemeral) is only allowed as a single local port.
@@ -143,6 +146,10 @@ pub struct Binding {
     pub protocol: Protocol,
     pub local: SocketAddr,
     pub target: SocketAddr,
+    /// Force `IPV6_V6ONLY` on. Only set for the `[::]` half of `*`, which has
+    /// to coexist with its `0.0.0.0` half; every other socket keeps the
+    /// system default.
+    pub ipv6_only: bool,
 }
 
 impl fmt::Display for Binding {
@@ -174,6 +181,7 @@ impl ForwardSpec {
                         protocol,
                         local: SocketAddr::new(ip, local_port),
                         target: SocketAddr::new(self.target_ip, target_port),
+                        ipv6_only: self.local_addr == LocalAddr::Any && ip.is_ipv6(),
                     });
                 }
             }
@@ -200,7 +208,9 @@ impl ForwardSpec {
 
     /// One-line, fully expanded description of what this spec does, e.g.
     /// `tcp+udp 0.0.0.0:80-81, [::]:80-81 -> 10.0.0.1:8080-8081 (2 ports, 8 sockets)`.
-    pub fn describe(&self) -> String {
+    /// `ipv6_dual_stack` is the system default for IPv6 sockets, which an
+    /// explicit `[::]` bind follows.
+    pub fn describe(&self, ipv6_dual_stack: bool) -> String {
         let protocols = match self.protocols {
             Protocols::Tcp => "tcp",
             Protocols::Udp => "udp",
@@ -212,6 +222,14 @@ impl ForwardSpec {
             .into_iter()
             .map(|ip| match ip {
                 IpAddr::V4(v4) => format!("{v4}:{}", self.local_ports),
+                IpAddr::V6(v6) if v6.is_unspecified() && self.local_addr != LocalAddr::Any => {
+                    let stack = if ipv6_dual_stack {
+                        "dual-stack, also IPv4"
+                    } else {
+                        "IPv6 only"
+                    };
+                    format!("[{v6}]:{} ({stack} per system default)", self.local_ports)
+                }
                 IpAddr::V6(v6) => format!("[{v6}]:{}", self.local_ports),
             })
             .collect();

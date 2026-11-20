@@ -68,3 +68,12 @@ pub fn is_unreserved_ephemeral_port(port: u16) -> bool {
         .unwrap_or_default();
     (start..=end).contains(&port) && !reserved.iter().any(|&(a, b)| (a..=b).contains(&port))
 }
+
+/// Whether new IPv6 sockets accept IPv4 traffic by default, i.e. what an
+/// IPv6 bind that does not touch `IPV6_V6ONLY` gets. Asks the kernel directly
+/// (a fresh socket reflects `net.ipv6.bindv6only`); false without IPv6.
+pub fn ipv6_dual_stack_default() -> bool {
+    socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)
+        .and_then(|socket| socket.only_v6())
+        .is_ok_and(|only_v6| !only_v6)
+}

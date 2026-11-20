@@ -114,8 +114,14 @@ pub(super) fn recv_from(
             } else if hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_PKTINFO {
                 let info: libc::in6_pktinfo = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
                 let ip = Ipv6Addr::from(info.ipi6_addr.s6_addr);
-                // Never answer from a multicast address.
-                if !ip.is_multicast() {
+                // IPv4 traffic on a dual-stack socket shows up as an
+                // IPv4-mapped address. Never answer from a multicast or
+                // broadcast address.
+                let unusable = ip.is_multicast()
+                    || ip
+                        .to_ipv4_mapped()
+                        .is_some_and(|v4| v4.is_multicast() || v4.is_broadcast());
+                if !unusable {
                     local = Some(LocalDst {
                         ip: IpAddr::V6(ip),
                         ifindex: info.ipi6_ifindex,

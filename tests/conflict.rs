@@ -1,13 +1,20 @@
-use mongoose::conflict::check;
+use mongoose::conflict::{ConflictError, check};
 use mongoose::spec::{ForwardSpec, PortRange, Protocol};
 
 fn specs(inputs: &[&str]) -> Vec<ForwardSpec> {
     inputs.iter().map(|s| s.parse().unwrap()).collect()
 }
 
+/// For specs without an explicit `[::]` the IPv6 default must not matter.
+fn check_both(specs: &[ForwardSpec]) -> Result<(), ConflictError> {
+    let dual = check(specs, true);
+    assert_eq!(dual, check(specs, false));
+    dual
+}
+
 #[test]
 fn disjoint_specs_pass() {
-    check(&specs(&[
+    check_both(&specs(&[
         "*:80:10.0.0.1:80",
         "*:81:10.0.0.1:80",
         "tcp:127.0.0.1:53:10.0.0.1:53",
@@ -19,13 +26,62 @@ fn disjoint_specs_pass() {
 }
 
 #[test]
-fn ipv4_and_ipv6_wildcards_do_not_collide() {
-    check(&specs(&["0.0.0.0:80:10.0.0.1:80", "[::]:80:10.0.0.1:80"])).unwrap();
+fn explicit_ipv6_unspecified_follows_the_system_default() {
+    for other in [
+        "tcp:0.0.0.0:80:10.0.0.1:80",
+        "tcp:127.0.0.1:80:10.0.0.1:80",
+        "tcp:*:80:10.0.0.1:80",
+    ] {
+        let rules = specs(&["tcp:[::]:80:10.0.0.1:80", other]);
+        let err = check(&rules, true).unwrap_err();
+        assert!(
+            err.0
+                .iter()
+                .any(|c| c.first_ip.is_ipv6() && c.second_ip.is_ipv4()),
+            "{other}: {err}"
+        );
+        // IPv6-only default: [::] only collides with the wildcard's [::].
+        match check(&rules, false) {
+            Ok(()) => assert!(!other.starts_with("tcp:*")),
+            Err(err) => assert!(err.0.iter().all(|c| c.second_ip.is_ipv6()), "{err}"),
+        }
+    }
+}
+
+#[test]
+fn wildcard_ipv6_half_never_reaches_ipv4() {
+    check_both(&specs(&[
+        "tcp:[::1]:80:10.0.0.1:80",
+        "tcp:127.0.0.1:80:10.0.0.1:80",
+    ]))
+    .unwrap();
+    let err = check_both(&specs(&[
+        "tcp:*:80:10.0.0.1:80",
+        "tcp:127.0.0.1:80:10.0.0.1:80",
+    ]))
+    .unwrap_err();
+    assert_eq!(err.0.len(), 1);
+    assert!(err.0[0].first_ip.is_ipv4());
+}
+
+#[test]
+fn dual_stack_report_names_both_addresses() {
+    let err = check(
+        &specs(&["udp:[::]:53:10.0.0.1:53", "udp:10.0.0.2:53:10.0.0.1:53"]),
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(err.0.len(), 1);
+    assert!(
+        err.0[0].to_string().ends_with("([::] vs 10.0.0.2)"),
+        "{}",
+        err.0[0]
+    );
 }
 
 #[test]
 fn ephemeral_ports_never_collide() {
-    check(&specs(&[
+    check_both(&specs(&[
         "tcp:127.0.0.1:0:10.0.0.1:80",
         "tcp:127.0.0.1:0:10.0.0.1:80",
     ]))
@@ -34,7 +90,7 @@ fn ephemeral_ports_never_collide() {
 
 #[test]
 fn identical_specs_collide() {
-    let err = check(&specs(&["tcp:127.0.0.1:80:10.0.0.1:80"; 2])).unwrap_err();
+    let err = check_both(&specs(&["tcp:127.0.0.1:80:10.0.0.1:80"; 2])).unwrap_err();
     assert_eq!(err.0.len(), 1);
     assert_eq!(err.0[0].first, 0);
     assert_eq!(err.0[0].second, 1);
@@ -43,13 +99,13 @@ fn identical_specs_collide() {
 
 #[test]
 fn wildcard_collides_with_specific_address() {
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:*:80:10.0.0.1:80",
         "tcp:127.0.0.1:80:10.0.0.1:80",
     ]))
     .unwrap_err();
     assert_eq!(err.0.len(), 1);
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:[::1]:80:10.0.0.1:80",
         "tcp:[::]:80:10.0.0.1:80",
     ]))
@@ -59,7 +115,7 @@ fn wildcard_collides_with_specific_address() {
 
 #[test]
 fn overlapping_ranges_are_reported_as_one_range() {
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:0.0.0.0:100-200:10.0.0.1:100",
         "tcp:0.0.0.0:150-250:10.0.0.1:1000",
     ]))
@@ -71,13 +127,13 @@ fn overlapping_ranges_are_reported_as_one_range() {
 
 #[test]
 fn every_collision_is_reported() {
-    let err = check(&specs(&[
+    let rules = specs(&[
         "*:80:10.0.0.1:80",
         "*:80:10.0.0.1:80",
         "udp:[::]:80:10.0.0.1:80",
-    ]))
-    .unwrap_err();
+    ]);
     // #1/#2: tcp v4, tcp v6, udp v4, udp v6; #1/#3 and #2/#3: udp v6.
+    let err = check(&rules, false).unwrap_err();
     assert_eq!(err.0.len(), 6);
     let text = err.to_string();
     assert!(
@@ -85,11 +141,13 @@ fn every_collision_is_reported() {
         "{text}"
     );
     assert_eq!(text.lines().count(), 7);
+    // Dual-stack: the explicit [::] also hits both rules' 0.0.0.0.
+    assert_eq!(check(&rules, true).unwrap_err().0.len(), 8);
 }
 
 #[test]
 fn adjacent_ranges_do_not_collide() {
-    check(&specs(&[
+    check_both(&specs(&[
         "tcp:*:100-199:10.0.0.1:1",
         "tcp:*:200-299:10.0.0.1:1",
     ]))
@@ -98,7 +156,7 @@ fn adjacent_ranges_do_not_collide() {
 
 #[test]
 fn contained_range_collides() {
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:0.0.0.0:100-199:10.0.0.1:1",
         "tcp:0.0.0.0:120:10.0.0.1:1",
     ]))
@@ -109,7 +167,7 @@ fn contained_range_collides() {
 
 #[test]
 fn ephemeral_never_collides_with_ranges() {
-    check(&specs(&[
+    check_both(&specs(&[
         "tcp:127.0.0.1:0:10.0.0.1:1",
         "tcp:*:1-65535:10.0.0.1:1",
     ]))
@@ -118,12 +176,12 @@ fn ephemeral_never_collides_with_ranges() {
 
 #[test]
 fn different_protocols_do_not_collide() {
-    check(&specs(&["tcp:*:80:10.0.0.1:80", "udp:*:80:10.0.0.1:80"])).unwrap();
+    check_both(&specs(&["tcp:*:80:10.0.0.1:80", "udp:*:80:10.0.0.1:80"])).unwrap();
 }
 
 #[test]
 fn report_mentions_both_rules() {
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:*:80:10.0.0.1:80",
         "tcp:127.0.0.1:80:10.0.0.1:81",
     ]))
@@ -137,7 +195,7 @@ fn report_mentions_both_rules() {
 
 #[test]
 fn each_pair_reports_its_own_range() {
-    let err = check(&specs(&[
+    let err = check_both(&specs(&[
         "tcp:127.0.0.1:10-20:10.0.0.1:10",
         "tcp:127.0.0.1:12:10.0.0.1:1",
         "tcp:127.0.0.1:15-16:10.0.0.1:1",
@@ -153,7 +211,7 @@ fn each_pair_reports_its_own_range() {
 #[test]
 fn large_ranges_are_checked_quickly() {
     let start = std::time::Instant::now();
-    let err = check(&specs(&["*:1-65535:10.0.0.1:1", "*:1-65535:10.0.0.2:1"])).unwrap_err();
+    let err = check_both(&specs(&["*:1-65535:10.0.0.1:1", "*:1-65535:10.0.0.2:1"])).unwrap_err();
     assert_eq!(err.0.len(), 4);
     assert!(
         err.0

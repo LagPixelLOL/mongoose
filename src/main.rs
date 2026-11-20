@@ -33,9 +33,9 @@ async fn main() -> ExitCode {
 }
 
 /// Logs the fully expanded rules, one line per rule.
-fn log_rules(specs: &[ForwardSpec]) {
+fn log_rules(specs: &[ForwardSpec], ipv6_dual_stack: bool) {
     for (index, spec) in specs.iter().enumerate() {
-        info!("rule #{}: {}", index + 1, spec.describe());
+        info!("rule #{}: {}", index + 1, spec.describe(ipv6_dual_stack));
     }
 }
 
@@ -43,8 +43,9 @@ async fn start(specs: &[ForwardSpec]) -> Result<()> {
     // Listen for signals before binding anything: a SIGTERM that arrives
     // between handler installation and subscription would otherwise be lost.
     let mut shutdown = Shutdown::install()?;
-    conflict::check(specs)?;
-    log_rules(specs);
+    let ipv6_dual_stack = sys::ipv6_dual_stack_default();
+    conflict::check(specs, ipv6_dual_stack)?;
+    log_rules(specs, ipv6_dual_stack);
 
     match sys::raise_fd_limit() {
         Ok(limit) => debug!("open file limit: {limit}"),
@@ -93,12 +94,13 @@ impl Shutdown {
 }
 
 fn setup(specs: &[ForwardSpec], skip_enable: bool) -> Result<()> {
-    conflict::check(specs)?;
+    let ipv6_dual_stack = sys::ipv6_dual_stack_default();
+    conflict::check(specs, ipv6_dual_stack)?;
     // The unit runs the binary from where it is now; it is never copied or moved.
     let exe = std::env::current_exe().context("cannot determine the mongoose executable path")?;
     let manager = ServiceManager::host();
     manager.precheck_setup(&exe)?;
-    log_rules(specs);
+    log_rules(specs, ipv6_dual_stack);
     match manager.setup(&exe, specs, skip_enable)? {
         SetupOutcome::Installed => info!("setup complete"),
         SetupOutcome::Replaced => info!("setup complete (replaced previous unit)"),

@@ -96,6 +96,8 @@ pub trait System {
     fn uses_systemd(&self) -> bool;
     /// Runs `systemctl` with `args`, returning its stdout.
     fn systemctl(&self, args: &[&str]) -> Result<String, ServiceError>;
+    /// Whether IPv6 sockets are dual-stack by default (for rule descriptions).
+    fn ipv6_dual_stack(&self) -> bool;
 }
 
 /// The real host system.
@@ -104,6 +106,10 @@ pub struct HostSystem;
 impl System for HostSystem {
     fn is_root(&self) -> bool {
         crate::sys::is_root()
+    }
+
+    fn ipv6_dual_stack(&self) -> bool {
+        crate::sys::ipv6_dual_stack_default()
     }
 
     fn uses_systemd(&self) -> bool {
@@ -565,6 +571,8 @@ pub struct ShowReport {
     pub conflicts: Vec<UnitConflict>,
     /// `Err` explains why the state is unavailable.
     pub state: Result<UnitState, String>,
+    /// System default for IPv6 sockets, used to describe `[::]` rules.
+    pub ipv6_dual_stack: bool,
 }
 
 fn or_unknown(value: &str) -> &str {
@@ -589,7 +597,7 @@ impl fmt::Display for ShowReport {
                 writeln!(f, "Rules:")?;
                 for (index, spec) in specs.iter().enumerate() {
                     writeln!(f, "  #{} {spec}", index + 1)?;
-                    writeln!(f, "     {}", spec.describe())?;
+                    writeln!(f, "     {}", spec.describe(self.ipv6_dual_stack))?;
                 }
             }
         }
@@ -674,6 +682,7 @@ impl<S: System> ServiceManager<S> {
             file,
             conflicts: self.find_conflicts(),
             state,
+            ipv6_dual_stack: self.system.ipv6_dual_stack(),
         })
     }
 }

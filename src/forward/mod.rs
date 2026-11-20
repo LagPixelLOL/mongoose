@@ -135,13 +135,13 @@ pub struct Bound {
 
 /// Binds a single listening socket. Must be called within a Tokio runtime.
 ///
-/// IPv6 sockets are always IPv6-only so `[::]` never captures IPv4 traffic and
-/// `*` can bind `0.0.0.0` and `[::]` side by side.
+/// `IPV6_V6ONLY` is left at the system default unless the binding asks for
+/// it (the `[::]` half of `*`, which must coexist with its `0.0.0.0` half).
 pub fn bind(binding: Binding) -> Result<BoundListener, BindError> {
     let wrap = |source| BindError { binding, source };
     let socket = match binding.protocol {
-        Protocol::Tcp => ListenSocket::Tcp(bind_tcp(binding.local).map_err(wrap)?),
-        Protocol::Udp => ListenSocket::Udp(bind_udp(binding.local).map_err(wrap)?),
+        Protocol::Tcp => ListenSocket::Tcp(bind_tcp(&binding).map_err(wrap)?),
+        Protocol::Udp => ListenSocket::Udp(bind_udp(&binding).map_err(wrap)?),
     };
     let local = match &socket {
         ListenSocket::Tcp(l) => l.local_addr(),
@@ -335,17 +335,18 @@ pub async fn serve(bound: Bound, config: ForwardConfig) -> Result<(), ServeError
     }
 }
 
-fn new_socket(addr: SocketAddr, ty: Type) -> io::Result<Socket> {
-    let socket = Socket::new(Domain::for_address(addr), ty, None)?;
-    if addr.is_ipv6() {
+fn new_socket(binding: &Binding, ty: Type) -> io::Result<Socket> {
+    let socket = Socket::new(Domain::for_address(binding.local), ty, None)?;
+    if binding.ipv6_only {
         socket.set_only_v6(true)?;
     }
     socket.set_nonblocking(true)?;
     Ok(socket)
 }
 
-fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
-    let socket = new_socket(addr, Type::STREAM)?;
+fn bind_tcp(binding: &Binding) -> io::Result<TcpListener> {
+    let addr = binding.local;
+    let socket = new_socket(binding, Type::STREAM)?;
     // Only allows rebinding over TIME_WAIT leftovers of our own previous
     // listener; Linux still refuses a port another socket is listening on.
     socket.set_reuse_address(true)?;
@@ -354,8 +355,9 @@ fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
-fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
-    let socket = new_socket(addr, Type::DGRAM)?;
+fn bind_udp(binding: &Binding) -> io::Result<UdpSocket> {
+    let addr = binding.local;
+    let socket = new_socket(binding, Type::DGRAM)?;
     if addr.ip().is_unspecified() {
         pktinfo::enable(&socket, addr.is_ipv6())?;
     }

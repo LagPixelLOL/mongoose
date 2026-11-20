@@ -7,15 +7,17 @@
 //! Two bindings collide when they use the same protocol and port and their
 //! local addresses either are equal or one of them is the unspecified address
 //! of the same family (`0.0.0.0` covers all IPv4 addresses, `[::]` all IPv6
-//! addresses; IPv6 sockets are IPv6-only so the families never overlap).
-//! Port 0 requests an ephemeral port and never collides.
+//! addresses). An explicit `[::]` keeps the system default, which on most
+//! systems is dual-stack: it then covers all IPv4 addresses too. The `[::]`
+//! half of `*` is always IPv6-only. Port 0 requests an ephemeral port and
+//! never collides.
 
 use std::fmt;
 use std::net::IpAddr;
 
 use thiserror::Error;
 
-use crate::spec::{ForwardSpec, PortRange, Protocol};
+use crate::spec::{ForwardSpec, LocalAddr, PortRange, Protocol};
 
 /// A collision between two specs (indices into the checked slice).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,8 +74,29 @@ impl fmt::Display for ConflictError {
     }
 }
 
-fn overlaps(a: IpAddr, b: IpAddr) -> bool {
-    a == b || a.is_unspecified() || b.is_unspecified()
+/// Local addresses of a spec, each with whether it also receives IPv4
+/// traffic (an explicit `[::]` on a dual-stack system).
+fn local_ips(spec: &ForwardSpec, ipv6_dual_stack: bool) -> Vec<(IpAddr, bool)> {
+    spec.local_addr
+        .ips()
+        .into_iter()
+        .map(|ip| {
+            let dual = ipv6_dual_stack
+                && ip.is_ipv6()
+                && ip.is_unspecified()
+                && spec.local_addr != LocalAddr::Any;
+            (ip, dual)
+        })
+        .collect()
+}
+
+fn overlaps((a, a_dual): (IpAddr, bool), (b, b_dual): (IpAddr, bool)) -> bool {
+    if a.is_ipv6() == b.is_ipv6() {
+        a == b || a.is_unspecified() || b.is_unspecified()
+    } else {
+        // Only a dual-stack [::] reaches into the IPv4 address space.
+        a_dual || b_dual
+    }
 }
 
 /// Port range used by both specs, if any. Ephemeral port 0 never collides.
@@ -85,10 +108,12 @@ fn shared_ports(a: PortRange, b: PortRange) -> Option<PortRange> {
 }
 
 /// Returns every collision between `specs`, or `Ok(())` if there is none.
+/// `ipv6_dual_stack` is the system default for IPv6 sockets (see
+/// [`crate::sys::ipv6_dual_stack_default`]).
 ///
 /// Each spec covers one contiguous port range, so collisions are found by
 /// intersecting ranges pairwise instead of expanding individual ports.
-pub fn check(specs: &[ForwardSpec]) -> Result<(), ConflictError> {
+pub fn check(specs: &[ForwardSpec], ipv6_dual_stack: bool) -> Result<(), ConflictError> {
     let mut conflicts = Vec::new();
     for (first, a) in specs.iter().enumerate() {
         for (offset, b) in specs[first + 1..].iter().enumerate() {
@@ -99,19 +124,17 @@ pub fn check(specs: &[ForwardSpec]) -> Result<(), ConflictError> {
                 if !b.protocols.list().contains(&protocol) {
                     continue;
                 }
-                for first_ip in a.local_addr.ips() {
-                    for second_ip in b.local_addr.ips() {
-                        if first_ip.is_ipv6() == second_ip.is_ipv6()
-                            && overlaps(first_ip, second_ip)
-                        {
+                for first_local in local_ips(a, ipv6_dual_stack) {
+                    for second_local in local_ips(b, ipv6_dual_stack) {
+                        if overlaps(first_local, second_local) {
                             conflicts.push(Conflict {
                                 first,
                                 second: first + 1 + offset,
                                 first_spec: *a,
                                 second_spec: *b,
                                 protocol,
-                                first_ip,
-                                second_ip,
+                                first_ip: first_local.0,
+                                second_ip: second_local.0,
                                 ports,
                             });
                         }

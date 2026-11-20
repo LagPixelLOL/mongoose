@@ -563,21 +563,75 @@ async fn udp_unreachable_target_keeps_session() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ipv6_listeners_are_ipv6_only() {
-    // Binding [::] must not take the IPv4 port as well. Another test may
-    // happen to hold the same port number on IPv4, so try a few ports; if
-    // [::] were not IPv6-only, every attempt would fail.
+async fn wildcard_binds_both_families_on_the_same_port() {
+    // Only works because the [::] half of `*` is IPv6-only; otherwise it
+    // would take the IPv4 port from its own 0.0.0.0 half.
     let config = ForwardConfig::default();
-    for _ in 0..20 {
-        let v6 = forward::bind_all(&[spec("tcp:[::]:0:127.0.0.1:1")], &config).unwrap();
-        let port = v6.listeners[0].local_addr().port();
-        let v4 = forward::bind_all(&[spec(&format!("tcp:0.0.0.0:{port}:127.0.0.1:1"))], &config)
-            .unwrap();
-        if v4.listeners.len() == 1 {
+    for _ in 0..10 {
+        let port = free_port_range(1);
+        let bound = forward::bind_all(&[spec(&format!("*:{port}:127.0.0.1:1"))], &config).unwrap();
+        if bound.in_use.is_empty() {
+            assert_eq!(bound.listeners.len(), 4);
             return;
         }
     }
-    panic!("binding [::] also took the IPv4 port");
+    panic!("the wildcard's IPv6 half also took the IPv4 port");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_ipv6_unspecified_keeps_the_system_default() {
+    let dual_stack = mongoose::sys::ipv6_dual_stack_default();
+    let config = ForwardConfig::default();
+    let v6 = forward::bind_all(&[spec("tcp:[::]:0:127.0.0.1:1")], &config).unwrap();
+    let port = v6.listeners[0].local_addr().port();
+    let v4 =
+        forward::bind_all(&[spec(&format!("tcp:0.0.0.0:{port}:127.0.0.1:1"))], &config).unwrap();
+    if dual_stack {
+        // The dual-stack [::] socket holds the IPv4 port as well.
+        assert_eq!(v4.in_use.len(), 1);
+    } else {
+        assert_eq!(v4.listeners.len(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dual_stack_ipv6_unspecified_forwards_ipv4_clients() {
+    if !mongoose::sys::ipv6_dual_stack_default() {
+        eprintln!("skipping: IPv6 sockets are IPv6-only by default here");
+        return;
+    }
+    let tcp_target = tcp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let udp_target = udp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let bindings = start(
+        &[
+            spec(&format!("tcp:[::]:0:127.0.0.1:{}", tcp_target.port())),
+            spec(&format!("udp:[::]:0:127.0.0.1:{}", udp_target.port())),
+        ],
+        ForwardConfig::default(),
+    );
+    let tcp_port = first(&bindings, Protocol::Tcp).port();
+    let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, tcp_port))
+        .await
+        .unwrap();
+    client.write_all(b"v4").await.unwrap();
+    let mut buf = [0u8; 2];
+    timeout(WAIT, client.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"v4");
+
+    let udp_port = first(&bindings, Protocol::Udp).port();
+    let mut destinations = vec![Ipv4Addr::LOCALHOST];
+    if ip_pktinfo_send_supported() {
+        // Replies must come from the IPv4 address the client used.
+        destinations.push(Ipv4Addr::new(127, 0, 0, 2));
+    }
+    for dst in destinations {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect((dst, udp_port)).await.unwrap();
+        assert_eq!(udp_roundtrip(&udp, b"mapped").await.1, b"mapped", "{dst}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

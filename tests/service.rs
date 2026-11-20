@@ -40,6 +40,10 @@ impl System for FakeSystem {
         self.systemd
     }
 
+    fn ipv6_dual_stack(&self) -> bool {
+        true
+    }
+
     fn systemctl(&self, args: &[&str]) -> Result<String, ServiceError> {
         let command = args.join(" ");
         self.calls.borrow_mut().push(command.clone());
