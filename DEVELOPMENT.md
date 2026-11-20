@@ -2,9 +2,9 @@
 
 ## Toolchain and building
 
-Mongoose uses the latest stable Rust; `rust-toolchain.toml` pins the `stable`
-channel, so `rustup` picks it up automatically. Dependencies are kept at their
-latest releases.
+Mongoose is built with Rust 1.99; `rust-toolchain.toml` pins that version,
+so `rustup` installs and uses it automatically. Dependencies are kept at their
+latest releases that build with it.
 
 ```sh
 cargo build             # debug build: target/debug/mongoose
