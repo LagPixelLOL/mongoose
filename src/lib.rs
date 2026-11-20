@@ -19,3 +19,5 @@ pub mod service;
 pub mod spec;
 #[cfg(target_os = "linux")]
 pub mod sys;
+#[cfg(target_os = "linux")]
+pub mod unitfile;

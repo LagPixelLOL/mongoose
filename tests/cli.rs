@@ -108,3 +108,38 @@ fn unknown_command_is_rejected() {
     assert!(parse(&["stop"]).is_err());
     assert!(parse(&[]).is_err());
 }
+
+#[test]
+fn force_flag_on_setup_and_remove_only() {
+    for flag in ["-f", "--force"] {
+        let cli = parse(&["setup", flag, "*:80:10.0.0.1:80"]).unwrap();
+        assert!(matches!(cli.command, Command::Setup { force: true, .. }));
+        let cli = parse(&["remove", flag]).unwrap();
+        assert!(matches!(cli.command, Command::Remove { force: true, .. }));
+    }
+    assert!(matches!(
+        parse(&["setup", "*:80:10.0.0.1:80"]).unwrap().command,
+        Command::Setup { force: false, .. }
+    ));
+    assert!(matches!(
+        parse(&["remove"]).unwrap().command,
+        Command::Remove { force: false, .. }
+    ));
+    let cli = parse(&["setup", "-s", "-f", "-v", "*:80:10.0.0.1:80"]).unwrap();
+    assert!(cli.verbose());
+    assert!(matches!(
+        cli.command,
+        Command::Setup {
+            force: true,
+            skip_enable: true,
+            ..
+        }
+    ));
+    for args in [
+        &["start", "-f", "*:80:10.0.0.1:80"][..],
+        &["show", "-f"],
+        &["remove", "-f", "-f"],
+    ] {
+        assert!(parse(args).is_err(), "{args:?}");
+    }
+}

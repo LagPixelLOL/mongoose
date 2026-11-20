@@ -55,6 +55,11 @@ pub enum Command {
         #[arg(short, long)]
         skip_enable: bool,
 
+        /// Replace an existing unit even if it was not written by `setup`, as
+        /// long as it is a regular, removable file on persistent storage
+        #[arg(short, long)]
+        force: bool,
+
         #[arg(required = true, value_name = "SPEC", help = SPEC_HELP)]
         specs: Vec<ForwardSpec>,
     },
@@ -62,6 +67,11 @@ pub enum Command {
     Remove {
         #[command(flatten)]
         verbose: Verbose,
+
+        /// Remove the unit even if it was not written by `setup`, as long as
+        /// it is a regular, removable file on persistent storage
+        #[arg(short, long)]
+        force: bool,
     },
     /// Show the rules and state of the systemd service created by `setup`
     Show {
@@ -75,7 +85,7 @@ impl Command {
         match self {
             Command::Start { verbose, .. }
             | Command::Setup { verbose, .. }
-            | Command::Remove { verbose }
+            | Command::Remove { verbose, .. }
             | Command::Show { verbose } => *verbose,
         }
     }

@@ -18,9 +18,12 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Start { specs, .. } => start(&specs).await,
         Command::Setup {
-            skip_enable, specs, ..
-        } => setup(&specs, skip_enable),
-        Command::Remove { .. } => remove(),
+            skip_enable,
+            force,
+            specs,
+            ..
+        } => setup(&specs, skip_enable, force),
+        Command::Remove { force, .. } => remove(force),
         Command::Show { .. } => show(),
     };
     match result {
@@ -93,23 +96,28 @@ impl Shutdown {
     }
 }
 
-fn setup(specs: &[ForwardSpec], skip_enable: bool) -> Result<()> {
+fn setup(specs: &[ForwardSpec], skip_enable: bool, force: bool) -> Result<()> {
     let ipv6_dual_stack = sys::ipv6_dual_stack_default();
     conflict::check(specs, ipv6_dual_stack)?;
     // The unit runs the binary from where it is now; it is never copied or moved.
     let exe = std::env::current_exe().context("cannot determine the mongoose executable path")?;
     let manager = ServiceManager::host();
-    manager.precheck_setup(&exe)?;
+    manager.precheck_setup(&exe, force)?;
     log_rules(specs, ipv6_dual_stack);
-    match manager.setup(&exe, specs, skip_enable)? {
+    // A failure after the unit is written is reported as is; nothing is
+    // rolled back.
+    let plan = manager.setup(&exe, specs, skip_enable, force)?;
+    match plan.outcome {
         SetupOutcome::Installed => info!("setup complete"),
-        SetupOutcome::Replaced => info!("setup complete (replaced previous unit)"),
+        SetupOutcome::Replaced | SetupOutcome::ReplacedForeign => {
+            info!("setup complete (replaced previous unit)");
+        }
     }
     Ok(())
 }
 
-fn remove() -> Result<()> {
-    ServiceManager::host().remove()?;
+fn remove(force: bool) -> Result<()> {
+    ServiceManager::host().remove(force)?;
     info!("mongoose service removed");
     Ok(())
 }
