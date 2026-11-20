@@ -10,7 +10,6 @@
 //! addresses; IPv6 sockets are IPv6-only so the families never overlap).
 //! Port 0 requests an ephemeral port and never collides.
 
-use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -28,13 +27,12 @@ pub struct Conflict {
     pub protocol: Protocol,
     pub first_ip: IpAddr,
     pub second_ip: IpAddr,
-    /// Colliding local ports, merged into ranges.
-    pub ports: Vec<PortRange>,
+    /// Colliding local ports.
+    pub ports: PortRange,
 }
 
 impl fmt::Display for Conflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ports: Vec<String> = self.ports.iter().map(ToString::to_string).collect();
         write!(
             f,
             "rule #{} '{}' and rule #{} '{}' both bind {} port {} ({} vs {})",
@@ -43,7 +41,7 @@ impl fmt::Display for Conflict {
             self.second + 1,
             self.second_spec,
             self.protocol,
-            ports.join(","),
+            self.ports,
             DisplayIp(self.first_ip),
             DisplayIp(self.second_ip),
         )
@@ -66,7 +64,7 @@ pub struct ConflictError(pub Vec<Conflict>);
 
 impl fmt::Display for ConflictError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} conflicting forwarding rule pair(s):", self.0.len())?;
+        write!(f, "{} conflict(s) between forwarding rules:", self.0.len())?;
         for conflict in &self.0 {
             write!(f, "\n  {conflict}")?;
         }
@@ -78,67 +76,53 @@ fn overlaps(a: IpAddr, b: IpAddr) -> bool {
     a == b || a.is_unspecified() || b.is_unspecified()
 }
 
-/// Returns every collision between `specs`, or `Ok(())` if there is none.
-pub fn check(specs: &[ForwardSpec]) -> Result<(), ConflictError> {
-    // (protocol, is_ipv6, port) -> bound (ip, spec index)
-    let mut bound: HashMap<(Protocol, bool, u16), Vec<(IpAddr, usize)>> = HashMap::new();
-    // (first, second, protocol, first ip, second ip) -> ports, in ascending order
-    let mut found: BTreeMap<(usize, usize, Protocol, IpAddr, IpAddr), Vec<u16>> = BTreeMap::new();
-
-    for (index, spec) in specs.iter().enumerate() {
-        for binding in spec.bindings() {
-            let port = binding.local.port();
-            if port == 0 {
-                continue;
-            }
-            let ip = binding.local.ip();
-            let entry = bound
-                .entry((binding.protocol, ip.is_ipv6(), port))
-                .or_default();
-            for &(other_ip, other) in entry.iter() {
-                if other != index && overlaps(ip, other_ip) {
-                    found
-                        .entry((other, index, binding.protocol, other_ip, ip))
-                        .or_default()
-                        .push(port);
-                }
-            }
-            entry.push((ip, index));
-        }
+/// Port range used by both specs, if any. Ephemeral port 0 never collides.
+fn shared_ports(a: PortRange, b: PortRange) -> Option<PortRange> {
+    if a.start() == 0 || b.start() == 0 {
+        return None;
     }
-
-    if found.is_empty() {
-        return Ok(());
-    }
-    let conflicts = found
-        .into_iter()
-        .map(
-            |((first, second, protocol, first_ip, second_ip), ports)| Conflict {
-                first,
-                second,
-                first_spec: specs[first],
-                second_spec: specs[second],
-                protocol,
-                first_ip,
-                second_ip,
-                ports: merge_ports(&ports),
-            },
-        )
-        .collect();
-    Err(ConflictError(conflicts))
+    PortRange::new(a.start().max(b.start()), a.end().min(b.end()))
 }
 
-/// Merges ascending ports into inclusive ranges.
-fn merge_ports(ports: &[u16]) -> Vec<PortRange> {
-    let mut ranges: Vec<PortRange> = Vec::new();
-    for &port in ports {
-        match ranges.last_mut() {
-            Some(last) if u32::from(last.end()) + 1 == u32::from(port) => {
-                *last = PortRange::new(last.start(), port).expect("ascending");
+/// Returns every collision between `specs`, or `Ok(())` if there is none.
+///
+/// Each spec covers one contiguous port range, so collisions are found by
+/// intersecting ranges pairwise instead of expanding individual ports.
+pub fn check(specs: &[ForwardSpec]) -> Result<(), ConflictError> {
+    let mut conflicts = Vec::new();
+    for (first, a) in specs.iter().enumerate() {
+        for (offset, b) in specs[first + 1..].iter().enumerate() {
+            let Some(ports) = shared_ports(a.local_ports, b.local_ports) else {
+                continue;
+            };
+            for &protocol in a.protocols.list() {
+                if !b.protocols.list().contains(&protocol) {
+                    continue;
+                }
+                for first_ip in a.local_addr.ips() {
+                    for second_ip in b.local_addr.ips() {
+                        if first_ip.is_ipv6() == second_ip.is_ipv6()
+                            && overlaps(first_ip, second_ip)
+                        {
+                            conflicts.push(Conflict {
+                                first,
+                                second: first + 1 + offset,
+                                first_spec: *a,
+                                second_spec: *b,
+                                protocol,
+                                first_ip,
+                                second_ip,
+                                ports,
+                            });
+                        }
+                    }
+                }
             }
-            Some(last) if last.end() >= port => {}
-            _ => ranges.push(PortRange::single(port)),
         }
     }
-    ranges
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(ConflictError(conflicts))
+    }
 }

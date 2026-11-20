@@ -68,7 +68,7 @@ fn conflicting_rules_fail_before_binding() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("conflicting forwarding rule pair"),
+        stderr.contains("conflict(s) between forwarding rules"),
         "{stderr}"
     );
     assert!(!stderr.contains("rule #1: "), "{stderr}");

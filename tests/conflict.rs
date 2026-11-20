@@ -38,7 +38,7 @@ fn identical_specs_collide() {
     assert_eq!(err.0.len(), 1);
     assert_eq!(err.0[0].first, 0);
     assert_eq!(err.0[0].second, 1);
-    assert_eq!(err.0[0].ports, vec![PortRange::single(80)]);
+    assert_eq!(err.0[0].ports, PortRange::single(80));
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn wildcard_collides_with_specific_address() {
 }
 
 #[test]
-fn overlapping_ranges_are_merged_in_report() {
+fn overlapping_ranges_are_reported_as_one_range() {
     let err = check(&specs(&[
         "tcp:0.0.0.0:100-200:10.0.0.1:100",
         "tcp:0.0.0.0:150-250:10.0.0.1:1000",
@@ -66,7 +66,7 @@ fn overlapping_ranges_are_merged_in_report() {
     .unwrap_err();
     assert_eq!(err.0.len(), 1);
     assert_eq!(err.0[0].protocol, Protocol::Tcp);
-    assert_eq!(err.0[0].ports, vec![PortRange::new(150, 200).unwrap()]);
+    assert_eq!(err.0[0].ports, PortRange::new(150, 200).unwrap());
 }
 
 #[test]
@@ -81,10 +81,39 @@ fn every_collision_is_reported() {
     assert_eq!(err.0.len(), 6);
     let text = err.to_string();
     assert!(
-        text.starts_with("6 conflicting forwarding rule pair(s):"),
+        text.starts_with("6 conflict(s) between forwarding rules:"),
         "{text}"
     );
     assert_eq!(text.lines().count(), 7);
+}
+
+#[test]
+fn adjacent_ranges_do_not_collide() {
+    check(&specs(&[
+        "tcp:*:100-199:10.0.0.1:1",
+        "tcp:*:200-299:10.0.0.1:1",
+    ]))
+    .unwrap();
+}
+
+#[test]
+fn contained_range_collides() {
+    let err = check(&specs(&[
+        "tcp:0.0.0.0:100-199:10.0.0.1:1",
+        "tcp:0.0.0.0:120:10.0.0.1:1",
+    ]))
+    .unwrap_err();
+    assert_eq!(err.0.len(), 1);
+    assert_eq!(err.0[0].ports, PortRange::single(120));
+}
+
+#[test]
+fn ephemeral_never_collides_with_ranges() {
+    check(&specs(&[
+        "tcp:127.0.0.1:0:10.0.0.1:1",
+        "tcp:*:1-65535:10.0.0.1:1",
+    ]))
+    .unwrap();
 }
 
 #[test]
@@ -107,7 +136,7 @@ fn report_mentions_both_rules() {
 }
 
 #[test]
-fn non_contiguous_ports_are_listed() {
+fn each_pair_reports_its_own_range() {
     let err = check(&specs(&[
         "tcp:127.0.0.1:10-20:10.0.0.1:10",
         "tcp:127.0.0.1:12:10.0.0.1:1",
@@ -115,8 +144,10 @@ fn non_contiguous_ports_are_listed() {
     ]))
     .unwrap_err();
     assert_eq!(err.0.len(), 2);
-    assert_eq!(err.0[0].ports, vec![PortRange::single(12)]);
-    assert_eq!(err.0[1].ports, vec![PortRange::new(15, 16).unwrap()]);
+    assert_eq!((err.0[0].first, err.0[0].second), (0, 1));
+    assert_eq!(err.0[0].ports, PortRange::single(12));
+    assert_eq!((err.0[1].first, err.0[1].second), (0, 2));
+    assert_eq!(err.0[1].ports, PortRange::new(15, 16).unwrap());
 }
 
 #[test]
@@ -127,7 +158,7 @@ fn large_ranges_are_checked_quickly() {
     assert!(
         err.0
             .iter()
-            .all(|c| c.ports == vec![PortRange::new(1, 65535).unwrap()])
+            .all(|c| c.ports == PortRange::new(1, 65535).unwrap())
     );
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(start.elapsed() < std::time::Duration::from_millis(50));
 }
