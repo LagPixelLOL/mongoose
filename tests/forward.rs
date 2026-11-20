@@ -82,6 +82,23 @@ async fn udp_roundtrip(client: &UdpSocket, payload: &[u8]) -> (String, Vec<u8>) 
     )
 }
 
+/// Connects and expects the forwarder to reset the connection. On a fast
+/// kernel the reset can arrive before the client's connect completes, so it
+/// may surface either from `connect` or from the first `read`.
+async fn expect_reset(addr: SocketAddr) {
+    let err = match TcpStream::connect(addr).await {
+        Err(err) => err,
+        Ok(mut client) => {
+            let mut buf = [0u8; 16];
+            timeout(WAIT, client.read(&mut buf))
+                .await
+                .expect("reset in time")
+                .expect_err("connection must be reset")
+        }
+    };
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset, "{err}");
+}
+
 /// Finds `count` consecutive ports free for both TCP and UDP on 127.0.0.1.
 fn free_port_range(count: u16) -> u16 {
     let seed = (std::process::id() as u16).wrapping_mul(7919);
@@ -167,12 +184,7 @@ async fn tcp_refused_target_resets_client() {
         &[spec(&format!("tcp:127.0.0.1:0:127.0.0.1:{port}"))],
         ForwardConfig::default(),
     );
-    let mut client = TcpStream::connect(first(&bindings, Protocol::Tcp))
-        .await
-        .unwrap();
-    let mut buf = [0u8; 16];
-    let result = timeout(WAIT, client.read(&mut buf)).await.unwrap();
-    assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+    expect_reset(first(&bindings, Protocol::Tcp)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,12 +245,7 @@ async fn tcp_connect_timeout_resets_client() {
         config,
     );
     let started = std::time::Instant::now();
-    let mut client = TcpStream::connect(first(&bindings, Protocol::Tcp))
-        .await
-        .unwrap();
-    let mut buf = [0u8; 16];
-    let result = timeout(WAIT, client.read(&mut buf)).await.unwrap();
-    assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+    expect_reset(first(&bindings, Protocol::Tcp)).await;
     // Reset only after the connect timeout, not by an immediate refusal.
     assert!(started.elapsed() >= Duration::from_millis(100));
 }
