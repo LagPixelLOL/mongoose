@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -123,6 +124,12 @@ fn remove(force: bool) -> Result<()> {
 }
 
 fn show() -> Result<()> {
-    println!("{}", ServiceManager::host().show()?);
-    Ok(())
+    let report = ServiceManager::host().show()?;
+    let mut out = std::io::stdout().lock();
+    // A closed pipe (e.g. `mongoose show | head`) is a normal end of output,
+    // not an error, and must not panic like println! would.
+    match writeln!(out, "{report}").and_then(|()| out.flush()) {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result.context("writing to stdout"),
+    }
 }

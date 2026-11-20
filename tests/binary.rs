@@ -256,3 +256,25 @@ fn sigterm_right_after_startup_is_not_lost() {
         assert!(wait_with_deadline(&mut child).success());
     }
 }
+
+#[test]
+fn show_into_a_closed_pipe_does_not_panic() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mongoose"))
+        .arg("show")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the reading end right away, like `mongoose show | head -0`.
+    drop(child.stdout.take());
+    let status = wait_with_deadline(&mut child);
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(status.success(), "{status}: {stderr}");
+}
