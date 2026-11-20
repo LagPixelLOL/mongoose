@@ -51,7 +51,8 @@ pub enum Command {
         #[command(flatten)]
         verbose: Verbose,
 
-        /// Only write the unit file; do not reload systemd or enable/start the unit
+        /// Only write the unit file: do not reload systemd, enable, start or
+        /// restart the unit (a running service keeps its previous rules)
         #[arg(short, long)]
         skip_enable: bool,
 

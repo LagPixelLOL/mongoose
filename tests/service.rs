@@ -305,7 +305,7 @@ fn setup_skip_enable_only_writes_when_not_running() {
 }
 
 #[test]
-fn setup_skip_enable_restarts_a_running_service() {
+fn setup_skip_enable_never_restarts_a_running_service() {
     for state in ["active", "activating", "reloading"] {
         let env = Env::new();
         install(&env, &env.etc);
@@ -315,12 +315,8 @@ fn setup_skip_enable_restarts_a_running_service() {
         });
         let new_rules = specs(&["*:81:10.0.0.1:81"]);
         manager.setup(&env.exe, &new_rules, true, false).unwrap();
-        // Reloaded so the restart uses the new rules; never enabled.
-        assert_eq!(
-            calls(&manager),
-            vec![ACTIVE_STATE, "daemon-reload", "restart mongoose.service"],
-            "{state}"
-        );
+        // Only the read-only state query, for the log hint.
+        assert_eq!(calls(&manager), vec![ACTIVE_STATE], "{state}");
         assert_eq!(
             fs::read_to_string(env.unit(&env.etc)).unwrap(),
             render_unit(&env.exe, &new_rules)

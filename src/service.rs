@@ -510,8 +510,8 @@ impl<S: System> ServiceManager<S> {
 
     /// Writes the unit and, unless `skip_enable`, reloads systemd, enables
     /// the unit and (re)starts it (restarting a running service, so it uses
-    /// the new rules). With `skip_enable` only a service that is already
-    /// running is reloaded and restarted; it is neither enabled nor started.
+    /// the new rules). With `skip_enable` nothing else is done; a running
+    /// service keeps its previous rules, which is pointed out in the log.
     pub fn setup(
         &self,
         exe: &Path,
@@ -535,16 +535,12 @@ impl<S: System> ServiceManager<S> {
         info!("wrote {}", path.display());
 
         if skip_enable {
+            info!("skipping systemd reload and enabling {UNIT_NAME}");
             if running {
-                // A restart without a reload would still use the old rules.
-                info!(
-                    "{UNIT_NAME} is running; reloading systemd and restarting it to apply the rules"
+                warn!(
+                    "{UNIT_NAME} is running and keeps using its previous rules; apply the new \
+                     ones with `systemctl daemon-reload && systemctl restart {UNIT_NAME}`"
                 );
-                self.system.systemctl(&["daemon-reload"])?;
-                self.system.systemctl(&["restart", UNIT_NAME])?;
-                info!("{UNIT_NAME} restarted (not enabled)");
-            } else {
-                info!("skipping systemd reload and enabling {UNIT_NAME}");
             }
             return Ok(plan);
         }
