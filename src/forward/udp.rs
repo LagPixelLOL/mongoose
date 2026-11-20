@@ -126,6 +126,27 @@ impl UdpForwarder {
     }
 }
 
+/// Sends on a connected upstream socket. An ICMP error from an earlier
+/// datagram (e.g. port unreachable while the target restarts) is reported as
+/// ECONNREFUSED by the next send *without* sending it, so retry once.
+fn try_send_upstream(session: &Session, data: &[u8]) -> io::Result<usize> {
+    match session.upstream.try_send(data) {
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            session.upstream.try_send(data)
+        }
+        result => result,
+    }
+}
+
+async fn send_upstream(session: &Session, data: &[u8]) -> io::Result<usize> {
+    match session.upstream.send(data).await {
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            session.upstream.send(data).await
+        }
+        result => result,
+    }
+}
+
 fn connect_upstream(target: SocketAddr) -> io::Result<UdpSocket> {
     let local: SocketAddr = if target.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
@@ -175,7 +196,7 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
                     return None;
                 }
             };
-            match session.upstream.try_send(&buf[..len]) {
+            match try_send_upstream(&session, &buf[..len]) {
                 Ok(_) => None,
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     Some((session, buf[..len].to_vec()))
@@ -187,7 +208,7 @@ pub(super) async fn run(socket: UdpSocket, binding: Binding, config: ForwardConf
             }
         });
         if let Some((session, data)) = pending
-            && let Err(err) = session.upstream.send(&data).await
+            && let Err(err) = send_upstream(&session, &data).await
         {
             debug!("udp {} -> {}: send failed: {err}", session.peer, fwd.target);
         }

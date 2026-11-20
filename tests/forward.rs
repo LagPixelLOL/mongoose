@@ -265,7 +265,6 @@ async fn idle_tcp_connection_is_never_timed_out() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn port_ranges_map_one_to_one() {
-    let local = free_port_range(3);
     let target = free_port_range(3);
     for port in target..target + 3 {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
@@ -279,6 +278,8 @@ async fn port_ranges_map_one_to_one() {
         });
         udp_echo(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
     }
+    // Picked after the targets are bound, so the ranges cannot overlap.
+    let local = free_port_range(3);
     start(
         &[spec(&format!(
             "127.0.0.1:{}-{}:127.0.0.1:{target}",
@@ -376,7 +377,88 @@ async fn udp_sessions_expire_when_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn udp_wildcard_listener_roundtrip() {
+    let echo = udp_echo("127.0.0.1:0".parse().unwrap()).await;
+    let bindings = start(
+        &[spec(&format!("udp:*:0:127.0.0.1:{}", echo.port()))],
+        ForwardConfig::default(),
+    );
+    let v4 = bindings.iter().find(|b| b.local.is_ipv4()).unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect((Ipv4Addr::LOCALHOST, v4.local.port()))
+        .await
+        .unwrap();
+    for payload in [&b"wild"[..], b"", &[1u8; 30_000][..]] {
+        let (_, reply) = udp_roundtrip(&client, payload).await;
+        assert_eq!(reply, payload);
+    }
+}
+
+/// Whether the platform honours `IP_PKTINFO` as a source address on send.
+/// Some sandboxes (e.g. gVisor) accept but ignore it.
+fn ip_pktinfo_send_supported() -> bool {
+    use std::os::fd::AsRawFd;
+    let server = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let one: libc::c_int = 1;
+    // SAFETY: valid fd and c_int option value.
+    unsafe {
+        libc::setsockopt(
+            server.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_PKTINFO,
+            std::ptr::from_ref(&one).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let port = server.local_addr().unwrap().port();
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.connect((Ipv4Addr::new(127, 0, 0, 2), port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    client.send(b"probe").unwrap();
+    let mut buf = [0u8; 16];
+    let (_, peer) = server.recv_from(&mut buf).unwrap();
+    let peer: socket2::SockAddr = peer.into();
+    let info = libc::in_pktinfo {
+        ipi_ifindex: 0,
+        ipi_spec_dst: libc::in_addr {
+            s_addr: u32::from(Ipv4Addr::new(127, 0, 0, 2)).to_be(),
+        },
+        ipi_addr: libc::in_addr { s_addr: 0 },
+    };
+    let mut control = [0u64; 8];
+    let mut iov = libc::iovec {
+        iov_base: b"probe".as_ptr().cast_mut().cast(),
+        iov_len: 5,
+    };
+    // SAFETY: all msghdr pointers refer to live buffers of the given sizes.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_name = peer.as_ptr().cast_mut().cast();
+        msg.msg_namelen = peer.len();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        let size = size_of::<libc::in_pktinfo>() as u32;
+        msg.msg_controllen = libc::CMSG_SPACE(size) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg).cmsg_type = libc::IP_PKTINFO;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), info);
+        libc::sendmsg(server.as_raw_fd(), &msg, 0);
+    }
+    client.recv(&mut buf).is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn udp_wildcard_replies_from_the_address_the_client_used() {
+    if !ip_pktinfo_send_supported() {
+        eprintln!("skipping: platform ignores IP_PKTINFO source addresses");
+        return;
+    }
     let echo = udp_echo("127.0.0.1:0".parse().unwrap()).await;
     let bindings = start(
         &[spec(&format!("udp:0.0.0.0:0:127.0.0.1:{}", echo.port()))],
