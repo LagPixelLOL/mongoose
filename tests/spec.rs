@@ -219,6 +219,28 @@ fn single_target_port_overflow_is_rejected() {
         }
     );
     assert!(parse("*:100-135:10.0.0.1:65500").is_ok());
+
+    let err = err("*:10000-20000:10.0.0.1:65534");
+    assert_eq!(
+        err,
+        SpecError::TargetRangeOverflow {
+            start: 65534,
+            len: 10001
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "target port 65534 with the local range's 10001 ports would end at port 75534, beyond 65535"
+    );
+    // Exactly reaching 65535 is fine, one more is not.
+    assert_eq!(
+        parse("*:10000-20000:10.0.0.1:55535").unwrap().target_ports,
+        PortRange::new(55535, 65535).unwrap()
+    );
+    assert!(parse("*:10000-20000:10.0.0.1:55536").is_err());
+    assert!(parse("*:1-65535:10.0.0.1:1").is_ok());
+    assert!(parse("*:1-65535:10.0.0.1:2").is_err());
+    assert!(parse("*:65535:10.0.0.1:65535").is_ok());
 }
 
 #[test]

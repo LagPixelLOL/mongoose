@@ -299,7 +299,10 @@ pub enum SpecError {
     ZeroTargetPort,
     #[error("target port range has {target} ports but local range has {local}")]
     RangeLengthMismatch { local: u32, target: u32 },
-    #[error("target port range starting at {start} with {len} ports exceeds 65535")]
+    #[error(
+        "target port {start} with the local range's {len} ports would end at port {}, beyond 65535",
+        u32::from(*start) + len - 1
+    )]
     TargetRangeOverflow { start: u16, len: u32 },
 }
 
